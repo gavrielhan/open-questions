@@ -1,0 +1,11 @@
+pandas
+openpyxl
+python-dotenv
+requests
+openai
+langchain
+langchain-openai
+langchain-community
+langchain-core
+flask
+
