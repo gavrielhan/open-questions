@@ -47,7 +47,7 @@ echo.
 echo Press Ctrl+C to stop the server.
 echo.
 
-python web_app.py
+python web_app_enhanced.py
 
 REM Keep window open if there's an error
 if errorlevel 1 (

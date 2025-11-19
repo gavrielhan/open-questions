@@ -19,7 +19,7 @@ if [ ! -f ".env" ]; then
 fi
 
 # Start the web application
-python3 web_app.py
+python3 web_app_enhanced.py
 
 # Keep terminal open if there's an error
 if [ $? -ne 0 ]; then

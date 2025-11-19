@@ -72,7 +72,7 @@ fi
 osascript <<APPLESCRIPT_EOF
 tell application "Terminal"
     activate
-    set currentTab to do script "cd \\"__SCRIPT_DIR_PLACEHOLDER__\\" && echo '🚀 Starting Topic Classification Web App...' && echo '' && python3 \\"__SCRIPT_DIR_PLACEHOLDER__/web_app.py\\""
+    set currentTab to do script "cd \\"__SCRIPT_DIR_PLACEHOLDER__\\" && echo '🚀 Starting Topic Classification Web App...' && echo '' && python3 \\"__SCRIPT_DIR_PLACEHOLDER__/web_app_enhanced.py\\""
 end tell
 APPLESCRIPT_EOF
 LAUNCHER_EOF
