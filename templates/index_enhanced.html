@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Topic Classification Tool - Enhanced</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 900px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 40px;
+        }
+
+        h1 {
+            color: #333;
+            font-size: 28px;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+
+        .subtitle {
+            color: #666;
+            font-size: 14px;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .step {
+            margin-bottom: 30px;
+            padding: 20px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            opacity: 0.5;
+            pointer-events: none;
+            transition: all 0.3s ease;
+        }
+
+        .step.active {
+            opacity: 1;
+            pointer-events: all;
+            border-color: #667eea;
+            background: #f8f9ff;
+        }
+
+        .step.completed {
+            opacity: 1;
+            border-color: #4caf50;
+            background: #f1f8f4;
+        }
+
+        .step-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+        }
+
+        .step-number {
+            background: #667eea;
+            color: white;
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 10px;
+            font-size: 14px;
+        }
+
+        .step.completed .step-number {
+            background: #4caf50;
+        }
+
+        /* Upload area */
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px 20px;
+            text-align: center;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            background: #f8f9ff;
+        }
+
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: #f0f2ff;
+        }
+
+        .upload-area.dragover {
+            border-color: #764ba2;
+            background: #e8eaff;
+            transform: scale(1.02);
+        }
+
+        .upload-icon {
+            font-size: 50px;
+            margin-bottom: 15px;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .file-info {
+            margin-top: 15px;
+            padding: 15px;
+            background: #e8f5e9;
+            border-radius: 10px;
+            display: none;
+        }
+
+        .file-info.visible {
+            display: block;
+        }
+
+        /* Form controls */
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+        }
+
+        select, input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s ease;
+        }
+
+        select:focus, input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .column-inputs {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+        }
+
+        /* Preview */
+        .preview-box {
+            background: #f5f5f5;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 15px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .preview-item {
+            padding: 8px;
+            border-bottom: 1px solid #e0e0e0;
+            font-size: 13px;
+        }
+
+        .preview-item:last-child {
+            border-bottom: none;
+        }
+
+        /* Buttons */
+        .button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 40px;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 20px;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+        }
+
+        .button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .button.success {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        }
+
+        /* Progress console */
+        .progress-console {
+            background: #1e1e1e;
+            color: #00ff00;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            display: none;
+        }
+
+        .progress-console.visible {
+            display: block;
+        }
+
+        .progress-line {
+            margin-bottom: 5px;
+        }
+
+        /* Status messages */
+        .status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 10px;
+            display: none;
+            text-align: center;
+        }
+
+        .status.visible {
+            display: block;
+        }
+
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+            display: none;
+        }
+
+        .spinner.visible {
+            display: block;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .info-badge {
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Topic Classification Tool</h1>
+        <p class="subtitle">Enhanced version with column selection and real-time progress</p>
+
+        <!-- Step 1: Upload File -->
+        <div class="step active" id="step1">
+            <div class="step-title">
+                <span class="step-number">1</span>
+                Upload File
+            </div>
+            <div class="upload-area" id="uploadArea">
+                <div class="upload-icon">📁</div>
+                <div class="upload-text">Click to browse or drag & drop</div>
+                <div class="upload-hint">Supported formats: .xlsx, .xls, .csv (max 100MB)</div>
+                <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+            </div>
+            <div class="file-info" id="fileInfo">
+                <strong id="fileName"></strong><br>
+                <span id="fileStats"></span>
+            </div>
+        </div>
+
+        <!-- Step 2: Select Sheet (if Excel) -->
+        <div class="step" id="step2">
+            <div class="step-title">
+                <span class="step-number">2</span>
+                Select Sheet
+            </div>
+            <div class="form-group">
+                <label for="sheetSelect">Choose which sheet to analyze:</label>
+                <select id="sheetSelect">
+                    <option value="">-- Select a sheet --</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Step 3: Select Columns -->
+        <div class="step" id="step3">
+            <div class="step-title">
+                <span class="step-number">3</span>
+                Select Columns
+            </div>
+            <div class="column-inputs">
+                <div class="form-group">
+                    <label for="answerColumn">Answer Column Letter:</label>
+                    <input type="text" id="answerColumn" placeholder="e.g., H" maxlength="3">
+                    <small style="color: #666;">Column with text to analyze</small>
+                </div>
+                <div class="form-group">
+                    <label for="topicStartColumn">Topics Start Letter:</label>
+                    <input type="text" id="topicStartColumn" placeholder="e.g., I" maxlength="3">
+                    <small style="color: #666;">First topic column</small>
+                </div>
+                <div class="form-group">
+                    <label for="topicEndColumn">Topics End Letter:</label>
+                    <input type="text" id="topicEndColumn" placeholder="e.g., Z" maxlength="3">
+                    <small style="color: #666;">Last topic column</small>
+                </div>
+            </div>
+            <button class="button" id="previewButton" style="margin-top: 15px;">Preview Selection</button>
+            
+            <div id="previewBox" style="display: none;">
+                <h4 style="margin: 15px 0 10px 0;">Preview:</h4>
+                <div class="preview-box" id="previewContent"></div>
+                <div class="status info visible" style="margin-top: 10px;" id="previewInfo"></div>
+            </div>
+        </div>
+
+        <!-- Step 4: Run Classification -->
+        <div class="step" id="step4">
+            <div class="step-title">
+                <span class="step-number">4</span>
+                Run Classification
+            </div>
+            <p style="color: #666; margin-bottom: 15px;">
+                All settings are configured. Click below to start the classification process.
+                The output will be saved as a CSV file on your Desktop.
+            </p>
+            <button class="button success" id="runButton">
+                🚀 Run Program
+            </button>
+        </div>
+
+        <!-- Progress Console -->
+        <div class="progress-console" id="progressConsole"></div>
+
+        <div class="spinner" id="spinner"></div>
+        <div class="status" id="status"></div>
+    </div>
+
+    <script>
+        let uploadedFile = null;
+        let sessionId = null;
+        let sheets = [];
+        let columns = [];
+
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const fileStats = document.getElementById('fileStats');
+        const sheetSelect = document.getElementById('sheetSelect');
+        const answerColumn = document.getElementById('answerColumn');
+        const topicStartColumn = document.getElementById('topicStartColumn');
+        const topicEndColumn = document.getElementById('topicEndColumn');
+        const previewButton = document.getElementById('previewButton');
+        const previewBox = document.getElementById('previewBox');
+        const previewContent = document.getElementById('previewContent');
+        const previewInfo = document.getElementById('previewInfo');
+        const runButton = document.getElementById('runButton');
+        const progressConsole = document.getElementById('progressConsole');
+        const spinner = document.getElementById('spinner');
+        const status = document.getElementById('status');
+
+        // Step management
+        function activateStep(stepNum) {
+            const step = document.getElementById(`step${stepNum}`);
+            step.classList.add('active');
+        }
+
+        function completeStep(stepNum) {
+            const step = document.getElementById(`step${stepNum}`);
+            step.classList.remove('active');
+            step.classList.add('completed');
+        }
+
+        // File upload handling
+        uploadArea.addEventListener('click', () => fileInput.click());
+
+        fileInput.addEventListener('change', (e) => handleFile(e.target.files[0]));
+
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            handleFile(e.dataTransfer.files[0]);
+        });
+
+        async function handleFile(file) {
+            if (!file) return;
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            spinner.classList.add('visible');
+            status.classList.remove('visible');
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    uploadedFile = file;
+                    sessionId = result.session_id;
+                    sheets = result.sheets;
+                    columns = result.columns;
+
+                    fileName.textContent = `📄 ${result.filename}`;
+                    fileStats.textContent = `${result.num_rows} rows × ${result.num_columns} columns`;
+                    fileInfo.classList.add('visible');
+
+                    completeStep(1);
+                    activateStep(2);
+
+                    // Populate sheet selector
+                    sheetSelect.innerHTML = '';
+                    sheets.forEach(sheet => {
+                        const option = document.createElement('option');
+                        option.value = sheet;
+                        option.textContent = sheet;
+                        sheetSelect.appendChild(option);
+                    });
+
+                    // Auto-select if only one sheet
+                    if (sheets.length === 1) {
+                        sheetSelect.value = sheets[0];
+                        handleSheetSelection();
+                    }
+                } else {
+                    showStatus('error', `❌ ${result.error || 'Upload failed'}`);
+                }
+            } catch (error) {
+                showStatus('error', `❌ Error: ${error.message}`);
+            } finally {
+                spinner.classList.remove('visible');
+            }
+        }
+
+        // Sheet selection
+        sheetSelect.addEventListener('change', handleSheetSelection);
+
+        function handleSheetSelection() {
+            if (sheetSelect.value) {
+                completeStep(2);
+                activateStep(3);
+            }
+        }
+
+        // Preview selection
+        previewButton.addEventListener('click', async () => {
+            const answer = answerColumn.value.trim().toUpperCase();
+            const start = topicStartColumn.value.trim().toUpperCase();
+            const end = topicEndColumn.value.trim().toUpperCase();
+            const sheet = sheetSelect.value;
+
+            if (!answer || !start || !end) {
+                showStatus('error', '❌ Please fill in all column letters');
+                return;
+            }
+
+            spinner.classList.add('visible');
+
+            try {
+                const response = await fetch('/preview', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sheet_name: sheet,
+                        answer_column: answer,
+                        topic_start_column: start,
+                        topic_end_column: end
+                    })
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    // Show preview
+                    previewContent.innerHTML = '';
+                    result.preview.forEach(item => {
+                        const div = document.createElement('div');
+                        div.className = 'preview-item';
+                        div.innerHTML = `<strong>Row ${item.row_num}:</strong> ${item.answer}`;
+                        previewContent.appendChild(div);
+                    });
+
+                    previewInfo.innerHTML = `
+                        <strong>Answer Column:</strong> ${result.answer_column}<br>
+                        <strong>Topic Columns:</strong> ${result.topic_columns.join(', ')}<br>
+                        <strong>Number of Topics:</strong> ${result.num_topics}
+                    `;
+
+                    previewBox.style.display = 'block';
+                    completeStep(3);
+                    activateStep(4);
+                } else {
+                    showStatus('error', `❌ ${result.error || 'Preview failed'}`);
+                }
+            } catch (error) {
+                showStatus('error', `❌ Error: ${error.message}`);
+            } finally {
+                spinner.classList.remove('visible');
+            }
+        });
+
+        // Run classification
+        runButton.addEventListener('click', async () => {
+            const answer = answerColumn.value.trim().toUpperCase();
+            const start = topicStartColumn.value.trim().toUpperCase();
+            const end = topicEndColumn.value.trim().toUpperCase();
+            const sheet = sheetSelect.value;
+
+            runButton.disabled = true;
+            progressConsole.classList.add('visible');
+            progressConsole.innerHTML = '<div class="progress-line">Starting classification...</div>';
+
+            try {
+                const response = await fetch('/classify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sheet_name: sheet,
+                        answer_column: answer,
+                        topic_start_column: start,
+                        topic_end_column: end
+                    })
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    // Start polling for progress
+                    pollProgress(result.session_id);
+                } else {
+                    showStatus('error', `❌ ${result.error || 'Classification failed'}`);
+                    runButton.disabled = false;
+                }
+            } catch (error) {
+                showStatus('error', `❌ Error: ${error.message}`);
+                runButton.disabled = false;
+            }
+        });
+
+        // Poll for progress updates
+        function pollProgress(sid) {
+            const interval = setInterval(async () => {
+                try {
+                    const response = await fetch(`/progress/${sid}`);
+                    const result = await response.json();
+
+                    // Add new messages
+                    result.messages.forEach(msg => {
+                        const div = document.createElement('div');
+                        div.className = 'progress-line';
+                        div.textContent = msg;
+                        progressConsole.appendChild(div);
+                    });
+
+                    // Scroll to bottom
+                    progressConsole.scrollTop = progressConsole.scrollHeight;
+
+                    // Check if done
+                    if (result.done) {
+                        clearInterval(interval);
+                        runButton.disabled = false;
+                        
+                        if (result.error) {
+                            showStatus('error', '❌ Classification failed. Check the console above for details.');
+                        } else {
+                            showStatus('success', '✅ Classification completed! Check your Desktop for the output CSV file.');
+                            completeStep(4);
+                        }
+                    }
+                } catch (error) {
+                    clearInterval(interval);
+                    showStatus('error', `❌ Error polling progress: ${error.message}`);
+                    runButton.disabled = false;
+                }
+            }, 500);  // Poll every 500ms
+        }
+
+        function showStatus(type, message) {
+            status.className = `status visible ${type}`;
+            status.innerHTML = message;
+        }
+    </script>
+</body>
+</html>
+
