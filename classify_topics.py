@@ -32,7 +32,7 @@ class OpenAIConfig:
     temperature: float = 0.0
     max_retries: int = 5
     retry_backoff_seconds: float = 2.0
-    batch_size: int = 5           # smaller = fewer 429s
+    batch_size: int = 3           # smaller = fewer 429s and shorter responses (reduced from 5 for 9 topics)
     parallel_workers: int = 2     # lower concurrency for LiteLLM
     request_delay_seconds: float = 0.5  # delay between API requests to avoid rate limits
     # Gemini config for JSON repair
@@ -85,9 +85,13 @@ def create_classification_chain(config: OpenAIConfig, topic_columns: Sequence[st
     from langchain_core.runnables import RunnableLambda
     
     # Create LLM with LiteLLM base URL
-    classification_max_tokens = max(config.max_tokens, 1000)
+    # Increase max_tokens significantly for batch processing with multiple topics
+    classification_max_tokens = max(config.max_tokens, 3000)  # Increased from 1000 to handle 9 topics in batch
     validation_max_tokens = max(config.max_tokens, 800)
     
+    # Main classification LLM - with logprobs for confidence extraction
+    # We need to use the underlying OpenAI client to get logprobs properly
+    # LangChain's ChatOpenAI doesn't directly support logprobs, so we'll extract them from raw API calls
     llm_classify = ChatOpenAI(
         model=config.model,
         base_url=config.api_base_url,
@@ -98,6 +102,16 @@ def create_classification_chain(config: OpenAIConfig, topic_columns: Sequence[st
     )
     
     llm_validate = ChatOpenAI(
+        model=config.model,
+        base_url=config.api_base_url,
+        api_key=config.api_key,
+        temperature=config.temperature,
+        max_tokens=validation_max_tokens,
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
+    
+    # Re-evaluation LLM for low confidence classifications
+    llm_reevaluate = ChatOpenAI(
         model=config.model,
         base_url=config.api_base_url,
         api_key=config.api_key,
@@ -183,24 +197,220 @@ def create_classification_chain(config: OpenAIConfig, topic_columns: Sequence[st
         HumanMessagePromptTemplate.from_template(validate_human),
     ])
     
+    # Re-evaluation prompt for low confidence classifications
+    reevaluate_system = (
+        "You are a senior expert annotator reviewing classifications that had low confidence scores. "
+        "Re-analyze the given question, text, and topic to make a more confident decision.\n\n"
+        "Guidelines:\n"
+        "- The question and text are in Hebrew. The topic name is also in Hebrew.\n"
+        "- Take extra care to verify if the topic is truly mentioned or discussed.\n"
+        "- If a text is empty or very short and with no real information, return 0 for all topics.\n"
+        "- Respond with JSON only; no markdown fences or commentary.\n"
+        "- Use integers 0 or 1 only. 1 means the topic is clearly mentioned, 0 otherwise.\n"
+        "- Be more decisive than the initial classification.\n"
+        "- Ensure all JSON strings are properly escaped and the output is valid JSON."
+    )
+    
+    reevaluate_human = (
+        "Re-evaluate this low-confidence classification with extra scrutiny.\n\n"
+        "Question: {question}\n"
+        "Text: {text}\n\n"
+        "Topic: {topic}\n"
+        "Initial Classification: {initial_value}\n"
+        "Confidence: {confidence:.2f}\n\n"
+        "Return the corrected classification as JSON:\n"
+        "{{\n"
+        "  \"{topic}\": 0 or 1\n"
+        "}}\n\n"
+        "Make a confident decision based on whether the topic is clearly present in the text."
+    )
+    
+    reevaluate_prompt = ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(reevaluate_system),
+        HumanMessagePromptTemplate.from_template(reevaluate_human),
+    ])
+    
     parser = JsonOutputParser()
     
-    # Transform classification result for validation
-    def format_for_validation(classify_result: dict) -> dict:
-        """Transform batch classification result into individual validation inputs."""
-        # This will be called per text, so we'll handle it in classify_batch
-        return classify_result
-    
     # Unified chain: classify -> validate (will be used per text in classify_batch)
-    classify_chain = classify_prompt | llm_classify | parser
+    classify_chain = classify_prompt | llm_classify
     validate_chain = validate_prompt | llm_validate | parser
+    reevaluate_chain = reevaluate_prompt | llm_reevaluate | parser
     
-    return classify_chain, validate_chain, topics_text
+    return classify_chain, validate_chain, reevaluate_chain, topics_text
 
 
 # ================================================================
 # API CALL WITH BACKOFF & REPAIR
 # ================================================================
+
+def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIConfig) -> Tuple[dict, float]:
+    """
+    Make a direct API call to get classification with logprobs for confidence calculation.
+    This bypasses LangChain to access logprobs directly.
+    """
+    import requests
+    
+    # Build the prompt
+    topics_text = inputs["topics"]
+    texts = inputs["texts"]
+    
+    sample_pairs = ", ".join(f'"{topics[i]}": 0' for i in range(min(3, len(topics))))
+    if len(topics) > 3:
+        sample_pairs += ", ..."
+    
+    system_prompt = (
+        "You are an expert annotator for academic media research analyzing Hebrew text. "
+        "For each numbered main text below (written in Hebrew), decide whether every topic is explicitly mentioned or clearly discussed.\n\n"
+        "Guidelines:\n"
+        "- The main texts are in Hebrew. The topic names are also in Hebrew.\n"
+        "- If a text is empty or very short and with no real information, return 0 for all topics.\n"
+        "- Respond with JSON only; no markdown fences or commentary.\n"
+        "- Use integers 0 or 1 only. 1 means the topic is clearly mentioned, 0 otherwise.\n"
+        "- If uncertain, choose 0.\n"
+        "- Include every topic exactly once per row and use the topic names exactly as provided.\n"
+        "- Ensure all JSON strings are properly escaped and the output is valid JSON."
+    )
+    
+    user_prompt = (
+        f"Return strictly valid JSON with the structure:\n"
+        f"{{\n"
+        f'  "1": {{{sample_pairs}}},\n'
+        f'  "2": {{...}},\n'
+        f"  ...\n"
+        f"}}\n\n"
+        f"Topics: {topics_text}\n\n"
+        f"Main texts (Hebrew):\n"
+        f"{texts}"
+    )
+    
+    url = config.api_base_url.rstrip("/") + "/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config.api_key}"
+    }
+    
+    classification_max_tokens = max(config.max_tokens, 3000)
+    
+    payload = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "response_format": {"type": "json_object"},
+        "max_tokens": classification_max_tokens,
+        "temperature": config.temperature,
+        "logprobs": True,
+        "top_logprobs": 5
+    }
+    
+    for attempt in range(1, config.max_retries + 1):
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract logprobs and calculate confidence
+            choice = data["choices"][0]
+            message_content = choice["message"]["content"]
+            
+            # Extract logprobs if available
+            logprobs = choice.get("logprobs")
+            confidence = 1.0  # Default
+            
+            if logprobs and "content" in logprobs:
+                import math
+                content_logprobs = logprobs["content"]
+                probs = []
+                for token_data in content_logprobs:
+                    if isinstance(token_data, dict) and "logprob" in token_data:
+                        prob = math.exp(token_data["logprob"])
+                        probs.append(prob)
+                if probs:
+                    confidence = sum(probs) / len(probs)
+            
+            # Parse JSON response
+            try:
+                initial_results = json.loads(message_content)
+            except json.JSONDecodeError:
+                repaired = _extract_json(message_content)
+                initial_results = json.loads(repaired)
+            
+            return initial_results, confidence
+            
+        except Exception as e:
+            if attempt == config.max_retries:
+                # Fallback to LangChain without logprobs
+                print(f"Warning: Could not get logprobs from API, using default confidence: {e}", file=sys.stderr)
+                classify_chain, _, _, _ = create_classification_chain(config, topics, inputs.get("question", ""))
+                initial_results = invoke_chain_with_retry(classify_chain, inputs, topics, config, return_raw=False)
+                return initial_results, 1.0
+            
+            wait = config.retry_backoff_seconds * attempt
+            if "429" in str(e) or "Rate limit" in str(e):
+                print(f"Rate limited. Sleeping {wait:.1f}s...", file=sys.stderr)
+            else:
+                print(f"Error {e}. Retrying in {wait:.1f}s...", file=sys.stderr)
+            time.sleep(wait)
+    
+    # Should not reach here, but just in case
+    return {}, 1.0
+
+
+def extract_confidence_from_logprobs(response) -> Dict[str, float]:
+    """
+    Extract confidence scores from logprobs in the LLM response.
+    Returns a dict mapping token positions to confidence scores.
+    """
+    import math
+    
+    confidences = {}
+    
+    try:
+        # Check if response has logprobs in response_metadata
+        if hasattr(response, 'response_metadata'):
+            logprobs_data = response.response_metadata.get('logprobs')
+            if logprobs_data:
+                # Handle different logprobs structures
+                if isinstance(logprobs_data, dict):
+                    if 'content' in logprobs_data:
+                        content_logprobs = logprobs_data['content']
+                        # Calculate average confidence from logprobs
+                        for idx, token_data in enumerate(content_logprobs):
+                            if isinstance(token_data, dict) and 'logprob' in token_data:
+                                # Convert log probability to probability (0-1)
+                                prob = math.exp(token_data['logprob'])
+                                confidences[idx] = prob
+                    elif 'token_logprobs' in logprobs_data:
+                        # Alternative structure
+                        token_logprobs = logprobs_data['token_logprobs']
+                        for idx, logprob in enumerate(token_logprobs):
+                            if logprob is not None:
+                                prob = math.exp(logprob)
+                                confidences[idx] = prob
+        
+        # Also check if logprobs are directly on the response
+        if hasattr(response, 'logprobs') and response.logprobs:
+            logprobs_data = response.logprobs
+            if isinstance(logprobs_data, list):
+                for idx, logprob in enumerate(logprobs_data):
+                    if logprob is not None:
+                        prob = math.exp(logprob) if isinstance(logprob, (int, float)) else 1.0
+                        confidences[idx] = prob
+        
+        # Return average confidence if available
+        if confidences:
+            avg_confidence = sum(confidences.values()) / len(confidences)
+            return {'average': avg_confidence}
+        
+    except Exception as e:
+        # Silently fail - logprobs may not be supported
+        pass
+    
+    # Default to high confidence if we can't extract logprobs (feature may not be supported)
+    return {'average': 1.0}
+
 
 def _extract_json(content: str) -> str:
     """
@@ -278,13 +488,30 @@ def _repair_json_with_gemini(
         return None
 
 
-def invoke_chain_with_retry(chain, inputs: dict, topic_columns: Sequence[str], config: OpenAIConfig) -> dict:
+def invoke_chain_with_retry(chain, inputs: dict, topic_columns: Sequence[str], config: OpenAIConfig, return_raw: bool = False) -> dict:
     """
     Invoke the LangChain chain with retry logic and JSON repair fallback.
+    
+    Args:
+        return_raw: If True, returns the raw response (for extracting logprobs), otherwise returns parsed JSON
     """
     for attempt in range(1, config.max_retries + 1):
         try:
             result = chain.invoke(inputs)
+            
+            # If raw response is requested (for logprobs extraction)
+            if return_raw:
+                return result
+            
+            # Parse the response content
+            if hasattr(result, 'content'):
+                content = result.content
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    repaired = _extract_json(content)
+                    return json.loads(repaired)
+            
             # Validate result structure
             if isinstance(result, dict):
                 return result
@@ -328,8 +555,9 @@ def invoke_chain_with_retry(chain, inputs: dict, topic_columns: Sequence[str], c
 
 def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, config: OpenAIConfig) -> List[Dict[str, int]]:
     """
-    Classify a batch of texts using the unified LangChain chain (classification + validation).
+    Classify a batch of texts using the unified LangChain chain (classification + validation + re-evaluation).
     Skips texts that are empty or have less than 2 characters (returns all 0s).
+    Re-evaluates classifications with confidence < 0.7.
     """
     # Filter out short texts - return all 0s for them
     results: List[Optional[Dict[str, int]]] = []
@@ -347,30 +575,33 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
     if not texts_to_process:
         return results
     
-    # Create unified chains
-    classify_chain, validate_chain, topics_text = create_classification_chain(config, topics, question)
+    # Create unified chains (now returns 4 items)
+    classify_chain, validate_chain, reevaluate_chain, topics_text = create_classification_chain(config, topics, question)
     
-    # Step 1: Batch classification (only for texts that passed the filter)
+    # Step 1: Batch classification with logprobs (only for texts that passed the filter)
     process_texts = [text for _, text in texts_to_process]
     enumerated_texts = "\n\n".join(f"{i+1}. {question}: {text}" for i, text in enumerate(process_texts))
     classify_inputs = {
         "topics": topics_text,
         "texts": enumerated_texts,
+        "question": question,
     }
     
-    initial_results = invoke_chain_with_retry(classify_chain, classify_inputs, topics, config)
+    # Use direct API call to get logprobs for confidence calculation
+    # This bypasses LangChain to access logprobs directly from the API
+    initial_results, overall_confidence = _classify_with_logprobs(classify_inputs, topics, config)
     
     # Rate limiting: add delay after classification before starting validation
     if config.request_delay_seconds > 0:
         time.sleep(config.request_delay_seconds)
     
-    # Parse initial results
+    # Parse initial results and track confidence per topic
     initial_classifications: List[Dict[str, int]] = []
     for i in range(1, len(process_texts) + 1):
         item = initial_results.get(str(i), {}) if isinstance(initial_results, dict) else {}
         initial_classifications.append({t: int(item.get(t, 0) in (1, "1", True)) for t in topics})
     
-    # Step 2: Validate each classification using the unified chain
+    # Step 2: Validate each classification
     validated_classifications: List[Dict[str, int]] = []
     
     for idx, (text, initial_class) in enumerate(zip(process_texts, initial_classifications)):
@@ -394,7 +625,39 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
                 t: int(validated.get(t, initial_class.get(t, 0)) in (1, "1", True))
                 for t in topics
             }
-            validated_classifications.append(validated_class)
+            
+            # Step 3: Re-evaluate low confidence classifications (confidence < 0.7)
+            # Use the confidence score extracted from logprobs
+            if overall_confidence < 0.7:
+                print(f"  ⚠️  Low confidence ({overall_confidence:.2f}) detected, re-evaluating topics...", file=sys.stderr)
+                
+                # Re-evaluate each topic individually for low confidence
+                final_class = {}
+                for topic in topics:
+                    reevaluate_inputs = {
+                        "question": question,
+                        "text": text,
+                        "topic": topic,
+                        "initial_value": validated_class[topic],
+                        "confidence": overall_confidence
+                    }
+                    
+                    try:
+                        reevaluated = invoke_chain_with_retry(reevaluate_chain, reevaluate_inputs, topics, config)
+                        # Extract the value for this specific topic
+                        final_class[topic] = int(reevaluated.get(topic, validated_class[topic]) in (1, "1", True))
+                        
+                        # Small delay between topic re-evaluations
+                        if config.request_delay_seconds > 0:
+                            time.sleep(config.request_delay_seconds * 0.5)
+                    except Exception as e:
+                        print(f"  Re-evaluation failed for topic '{topic}', keeping validated value: {e}", file=sys.stderr)
+                        final_class[topic] = validated_class[topic]
+                
+                validated_classifications.append(final_class)
+            else:
+                validated_classifications.append(validated_class)
+                
         except Exception as e:
             print(f"Validation failed, using initial classification: {e}", file=sys.stderr)
             validated_classifications.append(initial_class)
@@ -493,7 +756,7 @@ def update_topics(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Efficient LLM-based binary topic classification.")
-    p.add_argument("--input", type=Path, default=Path("open_question_data.xlsx"))
+    p.add_argument("--input", type=Path, default=Path("open question - steps to pull Med students back to Israel.csv"))
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--skip-existing", action="store_true")
@@ -504,16 +767,34 @@ def main() -> None:
     args = parse_args()
     cfg = OpenAIConfig.from_env()
 
-    df = pd.read_excel(args.input)
+    # Detect file type and read accordingly
+    if args.input.suffix.lower() == '.csv':
+        df = pd.read_csv(args.input)
+    else:
+        df = pd.read_excel(args.input)
+    
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
-    if len(df.columns) <= 10:
-        raise ValueError(f"Expected ≥11 columns, got {len(df.columns)}")
+    
+    # Determine column indices based on file type
+    if args.input.suffix.lower() == '.csv':
+        # CSV format: answer at index 0, topics at indices 1-9
+        if len(df.columns) < 10:
+            raise ValueError(f"Expected ≥10 columns for CSV, got {len(df.columns)}")
+        main_column = df.columns[0]
+        topics = df.columns[1:10].tolist()  # Indices 1-9 (inclusive)
+        print(f"CSV file detected")
+        print(f"Main text column (index 0): {main_column}")
+        print(f"Topics (indices 1-9): {topics}")
+    else:
+        # Excel format: answer at index 8, topics from index 9 onwards
+        if len(df.columns) <= 10:
+            raise ValueError(f"Expected ≥11 columns for Excel, got {len(df.columns)}")
+        main_column = df.columns[8]
+        topics = df.columns[9:].tolist()
+        print(f"Excel file detected")
+        print(f"Main text column (index 8): {main_column}")
+        print(f"Topics (from index 9): {topics}")
 
-    main_column = df.columns[8]
-    topics = df.columns[9:].tolist()
-
-    print(f"Main text column (index 8): {main_column}")
-    print(f"Topics ({len(topics)}): {topics}")
     print(f"Model: {cfg.model}, Base URL: {cfg.api_base_url}")
 
     df = update_topics(
@@ -525,8 +806,19 @@ def main() -> None:
         skip_existing=args.skip_existing,
     )
 
-    out = args.output or args.input.with_name("open_question_data_classified.xlsx")
-    df.to_excel(out, index=False)
+    # Save with appropriate extension
+    if args.output:
+        out = args.output
+    else:
+        if args.input.suffix.lower() == '.csv':
+            out = args.input.with_name(f"{args.input.stem}_classified.csv")
+        else:
+            out = args.input.with_name(f"{args.input.stem}_classified.xlsx")
+    
+    if out.suffix.lower() == '.csv':
+        df.to_csv(out, index=False)
+    else:
+        df.to_excel(out, index=False)
     print(f"✅ Done. Saved to {out}")
 
 
