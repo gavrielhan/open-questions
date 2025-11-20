@@ -17,6 +17,46 @@ AI-powered topic classification tool for Excel files with a beautiful web interf
 - All dependencies from `requirements.txt`
 - Valid API configuration in `.env` file
 
+## 🧰 Full Setup on a New Machine
+
+1. **Install prerequisites**
+   - Python 3.9+ (recommended) and `pip`
+   - Git
+   - (Optional) `virtualenv` or `conda`
+2. **Clone the repo**
+   ```bash
+   git clone https://github.com/gavrielhan/open-questions.git
+   cd open-questions
+   ```
+3. **Create and activate a virtual environment** (recommended)
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate       # macOS/Linux
+   venv\Scripts\activate          # Windows
+   ```
+4. **Install Python dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+5. **Create your `.env`**
+   ```
+   API_KEY=your_api_key_here
+   API_BASE_URL=https://your-litellm-endpoint
+   MODEL=openai/gpt-4o
+   # Optional extras:
+   # GEMINI_AI_KEY=...
+   # OPENAI_MAX_TOKENS=400
+   ```
+6. **Run a smoke test**
+   ```bash
+   python3 web_app_enhanced.py
+   ```
+   - Browser should open at `http://127.0.0.1:5000`
+   - Upload a small Excel/CSV to verify everything works
+7. **Create a desktop launcher (optional but recommended)**
+   - macOS: `chmod +x create_desktop_app.sh && ./create_desktop_app.sh`
+   - Windows: double-click `create_windows_shortcut.bat`
+
 ## 🛠️ Installation
 
 1. Clone this repository:
@@ -42,13 +82,13 @@ MODEL=your_model_name_here
 ### macOS
 
 **Option 1: Desktop App**
-1. Run `./create_desktop_app.sh` to create the desktop app
+1. Run `chmod +x create_desktop_app.sh && ./create_desktop_app.sh`
 2. Double-click `Topic Classifier.app` on your Desktop
 3. Browser opens automatically with the upload interface
 
 **Option 2: Terminal**
 ```bash
-python3 web_app.py
+python3 web_app_enhanced.py
 ```
 
 ### Windows
@@ -72,9 +112,17 @@ launch_app.bat
 ### Excel File Format
 
 - Must have at least 11 columns (0-10)
-- Column 8: Main text content (Hebrew)
-- Columns 9+: Topic headers (Hebrew)
+- `classify_topics.py` defaults:
+  - For Excel: column index 8 = main text, columns 9+ = topics
+  - For CSV (Med Students dataset): column index 0 = main text, columns 1-9 = topics
 - The tool will classify each row's text against all topics
+- To run from CLI:
+  ```bash
+  python3 classify_topics.py --input "path/to/file.xlsx"
+  # optional flags:
+  #   --limit 100
+  #   --skip-existing
+  ```
 
 ## 🔧 Configuration
 
@@ -84,16 +132,19 @@ See `.env.example` (if provided) or check `README_WEB_APP.md` for detailed confi
 
 - **`README_WEB_APP.md`**: General web app documentation
 - **`README_WINDOWS.md`**: Windows-specific setup guide
+- **`README_ENHANCED.md`**: Detailed walkthrough of the enhanced upload UI
 
 ## 🏗️ Project Structure
 
 ```
 open-questions/
 ├── web_app.py                  # Flask web application
+├── web_app_enhanced.py         # Enhanced upload interface with sheet/column selection
 ├── classify_topics.py          # Classification logic with LangChain
 ├── translate_columns.py        # Translation script
 ├── templates/
 │   └── index.html             # Upload page UI
+│   └── index_enhanced.html    # Enhanced upload UI
 ├── launch_app.bat             # Windows launcher
 ├── launch_app.command         # macOS launcher
 ├── create_desktop_app.sh      # macOS app creator
