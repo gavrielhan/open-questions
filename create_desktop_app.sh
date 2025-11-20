@@ -82,20 +82,25 @@ sed -i '' "s|__SCRIPT_DIR_PLACEHOLDER__|$SCRIPT_DIR|g" "$APP_PATH/Contents/MacOS
 
 chmod +x "$APP_PATH/Contents/MacOS/launcher"
 
+# Copy bundled icon if available
+ICON_SOURCE="$SCRIPT_DIR/assets/AppIcon.icns"
+if [ -f "$ICON_SOURCE" ]; then
+    cp "$ICON_SOURCE" "$APP_PATH/Contents/Resources/AppIcon.icns"
+    echo "🖼️  Attached custom macOS icon from $ICON_SOURCE"
+else
+    echo "⚠️  AppIcon.icns not found in assets/. Using default icon."
+fi
+
 # Create a README for icon customization
 cat > "$APP_PATH/Contents/Resources/README_ICON.txt" << 'ICON_README'
-To customize the app icon:
+This app already ships with a custom icon (assets/AppIcon.icns).
+If you ever want to replace it manually:
 
 1. Create an icon file (PNG or ICNS format)
 2. Right-click on 'Topic Classifier.app' on your Desktop
 3. Select 'Get Info'
 4. Drag your icon file onto the small icon in the top-left corner of the Info window
-5. The custom icon will be applied
-
-Alternatively, you can use the following command to create an icon from a PNG:
-  iconutil -c icns AppIcon.iconset -o AppIcon.icns
-
-For now, the app will use the default Terminal icon.
+5. The custom icon will be applied immediately
 ICON_README
 
 echo ""

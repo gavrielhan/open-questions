@@ -83,7 +83,7 @@ MODEL=your_model_name_here
 
 **Option 1: Desktop App**
 1. Run `chmod +x create_desktop_app.sh && ./create_desktop_app.sh`
-2. Double-click `Topic Classifier.app` on your Desktop
+2. Double-click `Topic Classifier.app` on your Desktop (custom icon is bundled via `assets/AppIcon.icns`)
 3. Browser opens automatically with the upload interface
 
 **Option 2: Terminal**
@@ -101,6 +101,11 @@ python3 web_app_enhanced.py
 ```cmd
 launch_app.bat
 ```
+
+## 🎨 App Icons
+- The repo ships with `assets/AppIcon.icns` (macOS) and `assets/app_icon.ico` (Windows) generated from `assets/logo.jpg`.
+- Re-run `create_desktop_app.sh` or `create_windows_shortcut.bat` after updating the logo to propagate the new icon.
+- Icons are applied automatically to the desktop app/shortcut; no manual steps required.
 
 ## 📖 Usage
 

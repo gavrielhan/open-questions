@@ -88,14 +88,17 @@ def read_file(filepath: Path, sheet_name=None):
 
 class ProgressCapture:
     """Capture print statements for progress display."""
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, queue: Queue):
         self.session_id = session_id
+        self.queue = queue
         self.terminal = sys.stdout
         
     def write(self, message):
         if message.strip():  # Ignore empty messages
-            if self.session_id in progress_queues:
-                progress_queues[self.session_id].put(message.strip())
+            try:
+                self.queue.put(message.strip())
+            except Exception:
+                pass  # Silently fail if queue is closed
         self.terminal.write(message)
     
     def flush(self):
@@ -208,10 +211,16 @@ def preview_data():
             }
             preview_data.append(row_data)
         
+        # Format topic columns as numbered list
+        topic_columns_formatted = []
+        for idx, topic in enumerate(topic_columns, 1):
+            topic_columns_formatted.append(f"{idx}) {topic}")
+        
         return jsonify({
             'success': True,
             'answer_column': answer_column_name,
             'topic_columns': topic_columns,
+            'topic_columns_formatted': topic_columns_formatted,
             'num_topics': len(topic_columns),
             'preview': preview_data
         })
@@ -257,16 +266,20 @@ def classify():
         # Load configuration
         config = OpenAIConfig.from_env()
         
+        # Get queue and output filename before thread starts
+        queue = progress_queues[session_id]
+        original_filename = session['original_filename']
+        
         # Run classification in a separate thread
         def run_classification():
             # Redirect stdout to capture progress
             old_stdout = sys.stdout
-            sys.stdout = ProgressCapture(session_id)
+            sys.stdout = ProgressCapture(session_id, queue)
             
             try:
-                progress_queues[session_id].put(f"Starting classification...")
-                progress_queues[session_id].put(f"Model: {config.model}")
-                progress_queues[session_id].put(f"Processing {len(df)} rows with {len(topic_cols)} topics")
+                queue.put(f"Starting classification...")
+                queue.put(f"Model: {config.model}")
+                queue.put(f"Processing {len(df)} rows with {len(topic_cols)} topics")
                 
                 # Run classification
                 df_classified = update_topics(
@@ -280,18 +293,18 @@ def classify():
                 
                 # Save to desktop as CSV
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                original_name = Path(session['original_filename']).stem
+                original_name = Path(original_filename).stem
                 output_filename = f"{original_name}_classified_{timestamp}.csv"
                 output_path = app.config['OUTPUT_FOLDER'] / output_filename
                 
                 df_classified.to_csv(output_path, index=False)
                 
-                progress_queues[session_id].put(f"✅ COMPLETE: Saved to {output_path}")
-                progress_queues[session_id].put("DONE")
+                queue.put(f"✅ COMPLETE: Saved to {output_path}")
+                queue.put("DONE")
                 
             except Exception as e:
-                progress_queues[session_id].put(f"❌ ERROR: {str(e)}")
-                progress_queues[session_id].put("ERROR")
+                queue.put(f"❌ ERROR: {str(e)}")
+                queue.put("ERROR")
             finally:
                 sys.stdout = old_stdout
         

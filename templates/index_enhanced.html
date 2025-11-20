@@ -298,6 +298,66 @@
             font-size: 12px;
             margin-left: 10px;
         }
+
+        /* Topic list styling with RTL support */
+        .topic-list {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 10px;
+            max-height: 300px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            border: 1px solid #e0e0e0;
+        }
+
+        /* Custom scrollbar styling */
+        .topic-list::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .topic-list::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 4px;
+        }
+
+        .topic-list::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 4px;
+        }
+
+        .topic-list::-webkit-scrollbar-thumb:hover {
+            background: #764ba2;
+        }
+
+        /* Firefox scrollbar styling */
+        .topic-list {
+            scrollbar-width: thin;
+            scrollbar-color: #667eea #f1f1f1;
+        }
+
+        .topic-item {
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+            line-height: 1.6;
+        }
+
+        .topic-item:last-child {
+            border-bottom: none;
+        }
+
+        /* Auto-detect RTL for Hebrew text */
+        .topic-item:has(.hebrew-text),
+        .topic-item:lang(he) {
+            direction: rtl;
+            text-align: right;
+        }
+
+        /* Fallback for browsers that don't support :has() */
+        .topic-item[dir="rtl"] {
+            direction: rtl;
+            text-align: right;
+        }
     </style>
 </head>
 <body>
@@ -549,10 +609,24 @@
                         previewContent.appendChild(div);
                     });
 
+                    // Helper function to detect Hebrew text
+                    function hasHebrew(text) {
+                        return /[\u0590-\u05FF]/.test(text);
+                    }
+
+                    // Format topic columns with proper numbering and RTL support
+                    let topicListHTML = '<div class="topic-list">';
+                    result.topic_columns_formatted.forEach(topic => {
+                        const isHebrew = hasHebrew(topic);
+                        const dirAttr = isHebrew ? ' dir="rtl"' : '';
+                        topicListHTML += `<div class="topic-item"${dirAttr}>${topic}</div>`;
+                    });
+                    topicListHTML += '</div>';
+
                     previewInfo.innerHTML = `
                         <strong>Answer Column:</strong> ${result.answer_column}<br>
-                        <strong>Topic Columns:</strong> ${result.topic_columns.join(', ')}<br>
-                        <strong>Number of Topics:</strong> ${result.num_topics}
+                        <strong>Topic Columns (${result.num_topics} topics):</strong>
+                        ${topicListHTML}
                     `;
 
                     previewBox.style.display = 'block';

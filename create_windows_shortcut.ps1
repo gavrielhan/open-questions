@@ -10,7 +10,7 @@ $shortcutPath = Join-Path $desktopPath "Topic Classifier.lnk"
 
 # Paths
 $batFile = Join-Path $scriptDir "launch_app.bat"
-$iconPath = Join-Path $scriptDir "icon.ico"  # Optional: add icon later
+$iconPath = Join-Path $scriptDir "assets\\app_icon.ico"
 
 Write-Host "Creating Windows desktop shortcut..." -ForegroundColor Cyan
 Write-Host ""
