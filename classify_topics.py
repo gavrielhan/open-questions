@@ -297,12 +297,14 @@ def create_classification_chain(config: OpenAIConfig, topic_columns: Sequence[st
 # API CALL WITH BACKOFF & REPAIR
 # ================================================================
 
-def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIConfig) -> Tuple[dict, float]:
+def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIConfig) -> Tuple[dict, Dict[str, float]]:
     """
     Make a direct API call to get classification with logprobs for confidence calculation.
-    This bypasses LangChain to access logprobs directly.
+    Returns: (results_dict, per_text_confidence_dict)
+    where per_text_confidence_dict maps text number ("1", "2", ...) to confidence score.
     """
     import requests
+    import math
     
     # Build the prompt
     topics_text = inputs["topics"]
@@ -392,26 +394,11 @@ def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIC
             response.raise_for_status()
             data = response.json()
             
-            # Extract logprobs and calculate confidence
+            # Extract logprobs and calculate per-text confidence
             choice = data["choices"][0]
             message_content = choice["message"]["content"]
             
-            # Extract logprobs if available
-            logprobs = choice.get("logprobs")
-            confidence = 1.0  # Default
-            
-            if logprobs and "content" in logprobs:
-                import math
-                content_logprobs = logprobs["content"]
-                probs = []
-                for token_data in content_logprobs:
-                    if isinstance(token_data, dict) and "logprob" in token_data:
-                        prob = math.exp(token_data["logprob"])
-                        probs.append(prob)
-                if probs:
-                    confidence = sum(probs) / len(probs)
-            
-            # Parse YAML response
+            # Parse YAML response first
             try:
                 initial_results = _parse_yaml_content(message_content)
             except ValueError as yaml_error:
@@ -429,7 +416,14 @@ def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIC
                     raise
                 initial_results = repaired
             
-            return initial_results, confidence
+            # Extract per-text confidence from logprobs
+            per_text_confidence = _extract_per_text_confidence(
+                message_content, 
+                choice.get("logprobs"), 
+                list(initial_results.keys())
+            )
+            
+            return initial_results, per_text_confidence
             
         except Exception as e:
             error_str = str(e)
@@ -563,6 +557,92 @@ def _parse_yaml_content(content: str) -> Dict[str, Any]:
     return normalized
 
 
+def _extract_per_text_confidence(content: str, logprobs_data: Optional[dict], text_keys: List[str]) -> Dict[str, float]:
+    """
+    Extract per-text confidence from logprobs by mapping tokens to text sections in YAML.
+    
+    Args:
+        content: The YAML response content
+        logprobs_data: The logprobs dict from the API response
+        text_keys: List of text keys like ["1", "2", "3"]
+    
+    Returns:
+        Dict mapping text_key -> confidence score (0.0-1.0)
+    """
+    import math
+    import re
+    
+    # Default: assume high confidence if we can't extract logprobs
+    default_confidence = 1.0
+    per_text_conf = {key: default_confidence for key in text_keys}
+    
+    if not logprobs_data or "content" not in logprobs_data:
+        return per_text_conf
+    
+    content_logprobs = logprobs_data["content"]
+    if not content_logprobs:
+        return per_text_conf
+    
+    try:
+        # Build a list of (token, logprob, char_position) from the response
+        token_list = []
+        char_pos = 0
+        for token_data in content_logprobs:
+            if not isinstance(token_data, dict):
+                continue
+            token_text = token_data.get("token", "")
+            logprob = token_data.get("logprob")
+            if logprob is not None:
+                token_list.append((token_text, logprob, char_pos))
+            char_pos += len(token_text)
+        
+        # Find the character ranges for each text section in the YAML
+        # YAML structure: "1:\n  topic: val\n2:\n  topic: val..."
+        text_ranges = {}
+        for key in text_keys:
+            # Look for pattern like "1:" or "\n1:" (text key followed by colon)
+            pattern = rf"(?:^|\n)({re.escape(key)}:)"
+            matches = list(re.finditer(pattern, content))
+            if matches:
+                start = matches[0].start()
+                # Find the next key or end of content
+                next_key_idx = text_keys.index(key) + 1
+                if next_key_idx < len(text_keys):
+                    next_key = text_keys[next_key_idx]
+                    next_pattern = rf"(?:^|\n)({re.escape(next_key)}:)"
+                    next_matches = list(re.finditer(next_pattern, content))
+                    end = next_matches[0].start() if next_matches else len(content)
+                else:
+                    end = len(content)
+                text_ranges[key] = (start, end)
+        
+        # Assign tokens to text sections and calculate per-text confidence
+        for key in text_keys:
+            if key not in text_ranges:
+                continue
+            start, end = text_ranges[key]
+            
+            # Collect logprobs for tokens in this range
+            text_logprobs = []
+            for token_text, logprob, char_pos in token_list:
+                # Check if this token overlaps with the text range
+                token_end = char_pos + len(token_text)
+                if char_pos >= start and char_pos < end:
+                    text_logprobs.append(logprob)
+            
+            # Calculate average confidence for this text
+            if text_logprobs:
+                probs = [math.exp(lp) for lp in text_logprobs]
+                per_text_conf[key] = sum(probs) / len(probs)
+        
+        return per_text_conf
+        
+    except Exception as e:
+        # If parsing fails, return default confidence for all texts
+        print(f"⚠️  Could not extract per-text confidence: {e}", file=sys.stderr)
+        return per_text_conf
+
+
 def _cell_has_content(value: Any) -> bool:
     """Return True if a cell contains non-empty content."""
     if value is None:
@@ -595,15 +675,6 @@ def _trim_trailing_empty_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
 
     rows_removed = original_rows - len(trimmed_df)
     return trimmed_df, rows_removed
-
-
-def _cell_has_content(value: Any) -> bool:
-    """Return True if a cell contains any meaningful content."""
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return value.strip() != ""
-    return not pd.isna(value)
 
 
 def _validate_with_direct_api(
@@ -1111,9 +1182,17 @@ def invoke_chain_with_retry(chain, inputs: dict, topic_columns: Sequence[str], c
 
 def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, config: OpenAIConfig) -> List[Dict[str, int]]:
     """
-    Classify a batch of texts using the unified LangChain chain (classification + validation + re-evaluation).
-    Skips texts that are empty or have less than 2 characters (returns all 0s).
-    Re-evaluates classifications with confidence < 0.6 using DeepSeek model.
+    Classify a batch of texts with per-text confidence tracking.
+    
+    Process:
+    1. Classification (GPT-5.1) → extracts per-text confidence from logprobs
+    2. Validation (GPT-5.1) → double-checks classifications
+    3. Re-evaluation (DeepSeek) → only for texts with confidence < 0.6
+    
+    Row tracking: texts_to_process stores (original_batch_idx, text) tuples,
+    so we can map results back to the correct DataFrame row indices.
+    
+    Returns: List of {topic: 0/1} dicts in the same order as input texts.
     """
     # Filter out short texts - return all 0s for them
     results: List[Optional[Dict[str, int]]] = []
@@ -1145,17 +1224,20 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
     
     # Use direct API call to get logprobs for confidence calculation
     # This bypasses LangChain to access logprobs directly from the API
-    initial_results, overall_confidence = _classify_with_logprobs(classify_inputs, topics, config)
+    initial_results, per_text_confidences = _classify_with_logprobs(classify_inputs, topics, config)
     
     # Rate limiting: add delay after classification before starting validation
     if config.request_delay_seconds > 0:
         time.sleep(config.request_delay_seconds)
     
-    # Parse initial results and track confidence per topic
+    # Parse initial results and track confidence per text
     initial_classifications: List[Dict[str, int]] = []
+    text_confidences: List[float] = []
     for i in range(1, len(process_texts) + 1):
         item = initial_results.get(str(i), {}) if isinstance(initial_results, dict) else {}
         initial_classifications.append({t: int(item.get(t, 0) in (1, "1", True)) for t in topics})
+        # Get confidence for this specific text
+        text_confidences.append(per_text_confidences.get(str(i), 1.0))
     
     # Step 2: Validate each classification using direct API calls
     validated_classifications: List[Dict[str, int]] = []
@@ -1163,7 +1245,7 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
     
     print("  ℹ️  Validating classifications with direct API calls", file=sys.stderr)
     
-    for idx, (text, initial_class) in enumerate(zip(process_texts, initial_classifications)):
+    for idx, (text, initial_class, text_confidence) in enumerate(zip(process_texts, initial_classifications, text_confidences)):
         # Skip validation for short texts
         if not text or len(text) < 2:
             validated_classifications.append({t: 0 for t in topics})
@@ -1183,8 +1265,9 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
             
             # Step 3: Re-evaluate low confidence classifications (confidence < 0.6)
             # Uses DeepSeek model for re-evaluation via direct API calls
-            if overall_confidence < 0.6:
-                print(f"  ⚠️  Low confidence ({overall_confidence:.2f}) detected, re-evaluating with DeepSeek...", file=sys.stderr)
+            # NOW CHECKING PER-TEXT CONFIDENCE instead of overall batch confidence
+            if text_confidence < 0.6:
+                print(f"  ⚠️  Low confidence ({text_confidence:.2f}) for text #{idx+1}, re-evaluating with DeepSeek...", file=sys.stderr)
                 
                 # Re-evaluate each topic individually for low confidence
                 reevaluation_error_log: List[str] = []
@@ -1198,7 +1281,7 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
                         text=text,
                         topic=topic,
                         initial_value=validated_class[topic],
-                        confidence=overall_confidence,
+                        confidence=text_confidence,
                         config=config,
                         error_log=reevaluation_error_log,
                     )
@@ -1220,7 +1303,7 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
                         classify_batch.low_confidence_warnings = []
                     classify_batch.low_confidence_warnings.append({
                         'text_index': idx,
-                        'confidence': overall_confidence,
+                        'confidence': text_confidence,
                         'errors': reevaluation_error_log
                     })
             else:
