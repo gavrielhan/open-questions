@@ -54,5 +54,5 @@ Write-Host "  1. Double-click 'Topic Classifier' on your Desktop" -ForegroundCol
 Write-Host "  2. A command window will open and start the web server" -ForegroundColor White
 Write-Host "  3. Your browser will open automatically" -ForegroundColor White
 Write-Host ""
-Write-Host "To remove: Right-click the shortcut → Delete" -ForegroundColor Gray
+Write-Host "To remove: Right-click the shortcut and select Delete" -ForegroundColor Gray
 

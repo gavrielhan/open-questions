@@ -219,12 +219,10 @@ def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIC
                     raise
                 initial_results = repaired
             
-            # Extract per-text confidence from logprobs
-            per_text_confidence = _extract_per_text_confidence(
-                message_content, 
-                choice.get("logprobs"), 
-                list(initial_results.keys())
-            )
+            # Note: Azure doesn't support logprobs, so we return default confidence
+            # Confidence is now determined by model agreement (GPT vs DeepSeek)
+            text_keys = list(initial_results.keys())
+            per_text_confidence = {key: 1.0 for key in text_keys}
             
             return initial_results, per_text_confidence
             
@@ -306,90 +304,280 @@ def _parse_yaml_content(content: str) -> Dict[str, Any]:
     return normalized
 
 
-def _extract_per_text_confidence(content: str, logprobs_data: Optional[dict], text_keys: List[str]) -> Dict[str, float]:
+def _classify_with_deepseek(inputs: dict, topics: Sequence[str], config: OpenAIConfig) -> dict:
     """
-    Extract per-text confidence from logprobs by mapping tokens to text sections in YAML.
+    Classify texts using DeepSeek model (for parallel comparison with GPT-5.1).
+    Returns: results_dict mapping text number to topic classifications.
+    """
+    # Build the prompt (same as GPT-5.1)
+    topics_text = inputs["topics"]
+    texts = inputs["texts"]
     
-    Args:
-        content: The YAML response content
-        logprobs_data: The logprobs dict from the API response
-        text_keys: List of text keys like ["1", "2", "3"]
+    sample_topics_block = "\n".join(f"    {topics[i]}: 0" for i in range(min(3, len(topics))))
+    if len(topics) > 3:
+        sample_topics_block += "\n    ..."
+    
+    system_prompt = (
+        "You are an expert annotator for academic media research analyzing Hebrew text. "
+        "For each numbered main text below (written in Hebrew), decide whether every topic is explicitly mentioned or clearly discussed.\n\n"
+        "Guidelines:\n"
+        "- The main texts are in Hebrew. The topic names are also in Hebrew.\n"
+        "- If a text is empty or very short and with no real information, return 0 for all topics.\n"
+        "- Respond with YAML only; no markdown fences or commentary.\n"
+        "- Use integers 0 or 1 only. 1 means the topic is clearly mentioned, 0 otherwise.\n"
+        "- If uncertain, choose 0.\n"
+        "- Include every topic exactly once per row and use the topic names exactly as provided.\n"
+        "- Ensure the YAML is strictly valid and properly indented."
+    )
+    
+    user_prompt = (
+        f"Return strictly valid YAML with the structure:\n"
+        f"1:\n"
+        f"{sample_topics_block}\n"
+        f"2:\n"
+        f"    ...\n\n"
+        f"Topics: {topics_text}\n\n"
+        f"Main texts (Hebrew):\n"
+        f"{texts}"
+    )
+    
+    # Use DeepSeek endpoint
+    base = config.repair_endpoint.rstrip("/")
+    url = f"{base}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config.repair_api_key or config.api_key}"
+    }
+    
+    payload = {
+        "model": config.repair_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "max_tokens": 3000,
+    }
+    
+    error_log: List[str] = []
+    
+    for attempt in range(1, config.max_retries + 1):
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            
+            message_content = data["choices"][0]["message"]["content"]
+            
+            # Parse YAML response
+            try:
+                results = _parse_yaml_content(message_content)
+                return results
+            except ValueError as yaml_error:
+                error_msg = str(yaml_error)
+                print(f"⚠️  DeepSeek YAML error: {error_msg}", file=sys.stderr)
+                error_log.append(f"YAML parse attempt {attempt}: {error_msg}")
+                
+                # Try to repair the YAML
+                repaired = _repair_yaml_auto(
+                    message_content,
+                    topics,
+                    config,
+                    error_message=error_msg,
+                    error_log=error_log,
+                )
+                if repaired is not None:
+                    return repaired
+                raise
+                
+        except Exception as e:
+            error_str = str(e)
+            error_log.append(f"DeepSeek attempt {attempt}: {error_str}")
+            print(f"⚠️  DeepSeek classification error (attempt {attempt}/{config.max_retries}): {error_str}", file=sys.stderr)
+            
+            if attempt == config.max_retries:
+                raise RuntimeError(f"DeepSeek classification failed after {config.max_retries} attempts: {error_str}")
+            
+            wait = config.retry_backoff_seconds * attempt
+            time.sleep(wait)
+    
+    return {}
+
+
+def _resolve_conflict_with_judge(
+    text: str,
+    question: str,
+    topic: str,
+    gpt_value: int,
+    deepseek_value: int,
+    config: OpenAIConfig,
+) -> int:
+    """
+    Use GPT-5.1 as a judge to resolve a conflict between GPT-5.1 and DeepSeek classifications.
+    
+    Returns: The resolved value (0 or 1)
+    """
+    system_prompt = (
+        "You are an expert linguist and logical analyst specializing in Hebrew text analysis. "
+        "Two independent AI classifiers have analyzed the same text and reached different conclusions "
+        "about whether a specific topic is present. Your task is to carefully analyze the text and "
+        "make the final determination.\n\n"
+        "You must respond with ONLY a single digit: 0 or 1.\n"
+        "- 1 = The topic IS clearly mentioned or discussed in the text\n"
+        "- 0 = The topic is NOT clearly mentioned or discussed in the text\n\n"
+        "Be rigorous: only return 1 if the topic is explicitly present, not merely implied."
+    )
+    
+    user_prompt = (
+        f"Two expert classifiers have analyzed the following Hebrew text and disagree about whether "
+        f"a specific topic is present.\n\n"
+        f"**Question context:** {question}\n\n"
+        f"**Text to analyze (Hebrew):**\n{text}\n\n"
+        f"**Topic in question:** {topic}\n\n"
+        f"**Classifier A (GPT-5.1) says:** {gpt_value} ({'topic IS present' if gpt_value == 1 else 'topic is NOT present'})\n"
+        f"**Classifier B (DeepSeek) says:** {deepseek_value} ({'topic IS present' if deepseek_value == 1 else 'topic is NOT present'})\n\n"
+        f"After careful analysis of the text, is the topic '{topic}' clearly mentioned or discussed?\n\n"
+        f"Respond with ONLY: 0 or 1"
+    )
+    
+    url = config.get_chat_completions_url()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config.api_key}"
+    }
+    
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+    }
+    
+    if config.is_azure():
+        payload["max_completion_tokens"] = 50  # Give enough room for the response
+    else:
+        payload["model"] = config.model
+        payload["max_tokens"] = 50
+        payload["temperature"] = 0
+    
+    for attempt in range(1, 3):  # 2 retries for judge
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            
+            # Debug: check the response
+            if response.status_code != 200:
+                print(f"⚠️  Judge API error {response.status_code}: {response.text[:200]}", file=sys.stderr)
+                response.raise_for_status()
+            
+            data = response.json()
+            
+            # Get the content
+            content = ""
+            if "choices" in data and len(data["choices"]) > 0:
+                content = data["choices"][0].get("message", {}).get("content", "").strip()
+            
+            # Extract 0 or 1 from response
+            # Check for "1" first since it's more specific
+            if content == "1" or content.startswith("1"):
+                return 1
+            elif content == "0" or content.startswith("0"):
+                return 0
+            elif "1" in content and "0" not in content:
+                return 1
+            elif "0" in content and "1" not in content:
+                return 0
+            elif not content:
+                # Empty response - retry with longer max tokens
+                print(f"⚠️  Judge returned empty response (attempt {attempt})", file=sys.stderr)
+                if attempt < 2:
+                    payload["max_completion_tokens"] = 100  # Try with more tokens
+                    continue
+                # Default to GPT's classification on empty response
+                print(f"    → Defaulting to GPT-5.1's answer: {gpt_value}", file=sys.stderr)
+                return gpt_value
+            else:
+                # Ambiguous response - default to conservative (0)
+                print(f"⚠️  Judge returned ambiguous response: '{content}', defaulting to 0", file=sys.stderr)
+                return 0
+                
+        except Exception as e:
+            print(f"⚠️  Judge error (attempt {attempt}/2): {e}", file=sys.stderr)
+            if attempt == 2:
+                # On failure, default to GPT-5.1's classification
+                print(f"  → Defaulting to GPT-5.1's answer: {gpt_value}", file=sys.stderr)
+                return gpt_value
+            time.sleep(1)
+    
+    return gpt_value
+
+
+def _compare_and_resolve_classifications(
+    gpt_results: dict,
+    deepseek_results: dict,
+    texts: List[str],
+    question: str,
+    topics: Sequence[str],
+    config: OpenAIConfig,
+) -> Tuple[List[Dict[str, int]], List[Dict]]:
+    """
+    Compare GPT-5.1 and DeepSeek classifications, resolve conflicts using GPT-5.1 as judge.
     
     Returns:
-        Dict mapping text_key -> confidence score (0.0-1.0)
+        - final_classifications: List of resolved classifications
+        - conflict_report: List of conflicts that were resolved (for reporting)
     """
-    import math
-    import re
+    final_classifications: List[Dict[str, int]] = []
+    conflict_report: List[Dict] = []
     
-    # Default: assume high confidence if we can't extract logprobs
-    default_confidence = 1.0
-    per_text_conf = {key: default_confidence for key in text_keys}
-    
-    if not logprobs_data or "content" not in logprobs_data:
-        return per_text_conf
-    
-    content_logprobs = logprobs_data["content"]
-    if not content_logprobs:
-        return per_text_conf
-    
-    try:
-        # Build a list of (token, logprob, char_position) from the response
-        token_list = []
-        char_pos = 0
-        for token_data in content_logprobs:
-            if not isinstance(token_data, dict):
-                continue
-            token_text = token_data.get("token", "")
-            logprob = token_data.get("logprob")
-            if logprob is not None:
-                token_list.append((token_text, logprob, char_pos))
-            char_pos += len(token_text)
+    for i in range(1, len(texts) + 1):
+        text_key = str(i)
+        text = texts[i - 1]
         
-        # Find the character ranges for each text section in the YAML
-        # YAML structure: "1:\n  topic: val\n2:\n  topic: val..."
-        text_ranges = {}
-        for key in text_keys:
-            # Look for pattern like "1:" or "\n1:" (text key followed by colon)
-            pattern = rf"(?:^|\n)({re.escape(key)}:)"
-            matches = list(re.finditer(pattern, content))
-            if matches:
-                start = matches[0].start()
-                # Find the next key or end of content
-                next_key_idx = text_keys.index(key) + 1
-                if next_key_idx < len(text_keys):
-                    next_key = text_keys[next_key_idx]
-                    next_pattern = rf"(?:^|\n)({re.escape(next_key)}:)"
-                    next_matches = list(re.finditer(next_pattern, content))
-                    end = next_matches[0].start() if next_matches else len(content)
-                else:
-                    end = len(content)
-                text_ranges[key] = (start, end)
+        gpt_class = gpt_results.get(text_key, {})
+        deepseek_class = deepseek_results.get(text_key, {})
         
-        # Assign tokens to text sections and calculate per-text confidence
-        for key in text_keys:
-            if key not in text_ranges:
-                continue
-            start, end = text_ranges[key]
+        final_class: Dict[str, int] = {}
+        text_conflicts: List[Dict] = []
+        
+        for topic in topics:
+            gpt_val = int(gpt_class.get(topic, 0) in (1, "1", True))
+            deepseek_val = int(deepseek_class.get(topic, 0) in (1, "1", True))
             
-            # Collect logprobs for tokens in this range
-            text_logprobs = []
-            for token_text, logprob, char_pos in token_list:
-                # Check if this token overlaps with the text range
-                token_end = char_pos + len(token_text)
-                if char_pos >= start and char_pos < end:
-                    text_logprobs.append(logprob)
-            
-            # Calculate average confidence for this text
-            if text_logprobs:
-                probs = [math.exp(lp) for lp in text_logprobs]
-                per_text_conf[key] = sum(probs) / len(probs)
+            if gpt_val == deepseek_val:
+                # Agreement - use the agreed value
+                final_class[topic] = gpt_val
+            else:
+                # Conflict - use judge to resolve
+                print(f"  ⚖️  Conflict on text #{i}, topic '{topic[:30]}...': GPT={gpt_val}, DeepSeek={deepseek_val}", file=sys.stderr)
+                
+                resolved = _resolve_conflict_with_judge(
+                    text=text,
+                    question=question,
+                    topic=topic,
+                    gpt_value=gpt_val,
+                    deepseek_value=deepseek_val,
+                    config=config,
+                )
+                
+                final_class[topic] = resolved
+                text_conflicts.append({
+                    "text_index": i,
+                    "topic": topic,
+                    "gpt_value": gpt_val,
+                    "deepseek_value": deepseek_val,
+                    "resolved_value": resolved,
+                })
+                
+                print(f"    → Judge resolved: {resolved}", file=sys.stderr)
+                
+                # Small delay between judge calls
+                if config.request_delay_seconds > 0:
+                    time.sleep(config.request_delay_seconds * 0.3)
         
-        return per_text_conf
-        
-    except Exception as e:
-        # If parsing fails, return default confidence for all texts
-        print(f"⚠️  Could not extract per-text confidence: {e}", file=sys.stderr)
-        return per_text_conf
+        final_classifications.append(final_class)
+        if text_conflicts:
+            conflict_report.extend(text_conflicts)
+    
+    return final_classifications, conflict_report
 
 
 def _cell_has_content(value: Any) -> bool:
@@ -406,21 +594,30 @@ def _trim_trailing_empty_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
     Trim only the trailing rows that are completely empty.
     We check ONLY the first column (answer column) - if it's empty, the row is empty,
     regardless of what's in the topic columns (which might have pre-filled 0s).
+    
+    Optimized: Works backwards from the end to find the last non-empty row quickly.
     """
     original_rows = len(df)
     if original_rows == 0:
         return df, 0
 
     # Check only the first column for content
+    # Work backwards from the end to find the last non-empty row
     first_col = df.iloc[:, 0]
-    non_empty_mask = first_col.apply(_cell_has_content)
+    last_non_empty_idx = -1
     
-    if non_empty_mask.any():
-        non_empty_positions = non_empty_mask.to_numpy().nonzero()[0]
-        last_pos = int(non_empty_positions[-1])
-        trimmed_df = df.iloc[: last_pos + 1].copy()
-    else:
+    # Start from the end and work backwards
+    for i in range(len(df) - 1, -1, -1):
+        if _cell_has_content(first_col.iloc[i]):
+            last_non_empty_idx = i
+            break
+    
+    if last_non_empty_idx == -1:
+        # All rows are empty, keep just the first row
         trimmed_df = df.iloc[:1].copy()
+    else:
+        # Keep everything up to and including the last non-empty row
+        trimmed_df = df.iloc[:last_non_empty_idx + 1].copy()
 
     rows_removed = original_rows - len(trimmed_df)
     return trimmed_df, rows_removed
@@ -827,18 +1024,22 @@ def _repair_yaml_auto(
 
 def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, config: OpenAIConfig) -> List[Dict[str, int]]:
     """
-    Classify a batch of texts with per-text confidence tracking.
+    Classify a batch of texts using PARALLEL DUAL-MODEL approach.
     
     Process:
-    1. Classification (GPT-5.1) → extracts per-text confidence from logprobs
-    2. Validation (GPT-5.1) → double-checks classifications
-    3. Re-evaluation (DeepSeek) → only for texts with confidence < 0.6
+    1. Run GPT-5.1 and DeepSeek classifications IN PARALLEL
+    2. Compare results to identify agreements and conflicts
+    3. For conflicts, use GPT-5.1 as a "judge" to make final decision
     
-    Row tracking: texts_to_process stores (original_batch_idx, text) tuples,
-    so we can map results back to the correct DataFrame row indices.
+    This approach replaces logprobs-based confidence (unavailable on Azure)
+    with model agreement as a confidence signal:
+    - Agreement = high confidence (both models agree)
+    - Disagreement = low confidence → resolve with judge
     
     Returns: List of {topic: 0/1} dicts in the same order as input texts.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
     # Filter out short texts - return all 0s for them
     results: List[Optional[Dict[str, int]]] = []
     texts_to_process: List[Tuple[int, str]] = []
@@ -855,10 +1056,8 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
     if not texts_to_process:
         return results
     
-    # No longer using LangChain - all API calls are direct
+    # Prepare classification inputs
     topics_text = ", ".join(topics)
-    
-    # Step 1: Batch classification with logprobs (only for texts that passed the filter)
     process_texts = [text for _, text in texts_to_process]
     enumerated_texts = "\n\n".join(f"{i+1}. {question}: {text}" for i, text in enumerate(process_texts))
     classify_inputs = {
@@ -867,103 +1066,99 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
         "question": question,
     }
     
-    # Use direct API call to get logprobs for confidence calculation
-    # This bypasses LangChain to access logprobs directly from the API
-    initial_results, per_text_confidences = _classify_with_logprobs(classify_inputs, topics, config)
+    print("  🔄 Running parallel classification (GPT-5.1 + DeepSeek)...", file=sys.stderr)
     
-    # Rate limiting: add delay after classification before starting validation
-    if config.request_delay_seconds > 0:
-        time.sleep(config.request_delay_seconds)
+    # Step 1: Run GPT-5.1 and DeepSeek in PARALLEL
+    gpt_results = None
+    deepseek_results = None
+    gpt_error = None
+    deepseek_error = None
     
-    # Parse initial results and track confidence per text
-    initial_classifications: List[Dict[str, int]] = []
-    text_confidences: List[float] = []
-    for i in range(1, len(process_texts) + 1):
-        item = initial_results.get(str(i), {}) if isinstance(initial_results, dict) else {}
-        initial_classifications.append({t: int(item.get(t, 0) in (1, "1", True)) for t in topics})
-        # Get confidence for this specific text
-        text_confidences.append(per_text_confidences.get(str(i), 1.0))
-    
-    # Step 2: Validate each classification using direct API calls
-    validated_classifications: List[Dict[str, int]] = []
-    validation_error_log: List[str] = []
-    
-    print("  ℹ️  Validating classifications with direct API calls", file=sys.stderr)
-    
-    for idx, (text, initial_class, text_confidence) in enumerate(zip(process_texts, initial_classifications, text_confidences)):
-        # Skip validation for short texts
-        if not text or len(text) < 2:
-            validated_classifications.append({t: 0 for t in topics})
-            continue
-        
+    def run_gpt():
         try:
-            # Use direct API call for validation
-            validated_class = _validate_with_direct_api(
-                question=question,
-                text=text,
-                initial_classifications=initial_class,
-                topics=topics,
-                config=config,
-                error_log=validation_error_log,
-                text_index=idx,
-            )
-            
-            # Step 3: Re-evaluate low confidence classifications (confidence < 0.6)
-            # Uses DeepSeek model for re-evaluation via direct API calls
-            # NOW CHECKING PER-TEXT CONFIDENCE instead of overall batch confidence
-            if text_confidence < 0.6:
-                print(f"  ⚠️  Low confidence ({text_confidence:.2f}) for text #{idx+1}, re-evaluating with DeepSeek...", file=sys.stderr)
-                
-                # Re-evaluate each topic individually for low confidence
-                reevaluation_error_log: List[str] = []
-                final_class = {}
-                any_reevaluation_failed = False
-                
-                for topic in topics:
-                    # Use direct API call to DeepSeek (bypasses LangChain issues)
-                    new_value, success = _reevaluate_with_deepseek(
-                        question=question,
-                        text=text,
-                        topic=topic,
-                        initial_value=validated_class[topic],
-                        confidence=text_confidence,
-                        config=config,
-                        error_log=reevaluation_error_log,
-                    )
-                    final_class[topic] = new_value
-                    
-                    if not success:
-                        any_reevaluation_failed = True
-                    
-                    # Small delay between topic re-evaluations
-                    if config.request_delay_seconds > 0:
-                        time.sleep(config.request_delay_seconds * 0.5)
-                
-                validated_classifications.append(final_class)
-                
-                # If any re-evaluation failed, mark this text for low-confidence warning
-                if any_reevaluation_failed:
-                    # Store metadata about this failure (we'll track it globally later)
-                    if not hasattr(classify_batch, 'low_confidence_warnings'):
-                        classify_batch.low_confidence_warnings = []
-                    classify_batch.low_confidence_warnings.append({
-                        'text_index': idx,
-                        'confidence': text_confidence,
-                        'errors': reevaluation_error_log
-                    })
-            else:
-                # High confidence (>= 0.6), use validated classification as-is
-                validated_classifications.append(validated_class)
-                
+            results, _ = _classify_with_logprobs(classify_inputs, topics, config)
+            return results
         except Exception as e:
-            print(f"Validation failed, using initial classification: {e}", file=sys.stderr)
-            validated_classifications.append(initial_class)
-        
-            # Rate limiting: add delay between validation requests (except for the last one)
-            if idx < len(process_texts) - 1 and config.request_delay_seconds > 0:
-                time.sleep(config.request_delay_seconds)
+            return e
     
-    # Merge validated results back into original order
+    def run_deepseek():
+        try:
+            return _classify_with_deepseek(classify_inputs, topics, config)
+        except Exception as e:
+            return e
+    
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        gpt_future = executor.submit(run_gpt)
+        deepseek_future = executor.submit(run_deepseek)
+        
+        gpt_result = gpt_future.result()
+        deepseek_result = deepseek_future.result()
+        
+        if isinstance(gpt_result, Exception):
+            gpt_error = gpt_result
+            print(f"  ⚠️  GPT-5.1 classification failed: {gpt_error}", file=sys.stderr)
+        else:
+            gpt_results = gpt_result
+            print(f"  ✅ GPT-5.1 classification complete", file=sys.stderr)
+        
+        if isinstance(deepseek_result, Exception):
+            deepseek_error = deepseek_result
+            print(f"  ⚠️  DeepSeek classification failed: {deepseek_error}", file=sys.stderr)
+        else:
+            deepseek_results = deepseek_result
+            print(f"  ✅ DeepSeek classification complete", file=sys.stderr)
+    
+    # Handle failures
+    if gpt_results is None and deepseek_results is None:
+        # Both failed - raise error
+        raise RuntimeError(f"Both GPT-5.1 and DeepSeek classification failed. GPT error: {gpt_error}. DeepSeek error: {deepseek_error}")
+    
+    if gpt_results is None:
+        # Only DeepSeek succeeded - use its results
+        print(f"  ⚠️  Using DeepSeek results only (GPT-5.1 failed)", file=sys.stderr)
+        final_classifications = []
+        for i in range(1, len(process_texts) + 1):
+            item = deepseek_results.get(str(i), {})
+            final_classifications.append({t: int(item.get(t, 0) in (1, "1", True)) for t in topics})
+    elif deepseek_results is None:
+        # Only GPT-5.1 succeeded - use its results
+        print(f"  ⚠️  Using GPT-5.1 results only (DeepSeek failed)", file=sys.stderr)
+        final_classifications = []
+        for i in range(1, len(process_texts) + 1):
+            item = gpt_results.get(str(i), {})
+            final_classifications.append({t: int(item.get(t, 0) in (1, "1", True)) for t in topics})
+    else:
+        # Both succeeded - compare and resolve conflicts
+        print(f"  ⚖️  Comparing results and resolving conflicts...", file=sys.stderr)
+        
+        final_classifications, conflict_report = _compare_and_resolve_classifications(
+            gpt_results=gpt_results,
+            deepseek_results=deepseek_results,
+            texts=process_texts,
+            question=question,
+            topics=topics,
+            config=config,
+        )
+        
+        # Report conflict statistics
+        if conflict_report:
+            # Count unique texts with conflicts
+            texts_with_conflicts = len(set(c['text_index'] for c in conflict_report))
+            print(f"  📊 Resolved {len(conflict_report)} conflicts across {texts_with_conflicts} texts", file=sys.stderr)
+            
+            # Store conflict report for later analysis
+            if not hasattr(classify_batch, 'conflict_reports'):
+                classify_batch.conflict_reports = []
+            classify_batch.conflict_reports.append({
+                'batch_texts': len(process_texts),
+                'total_conflicts': len(conflict_report),
+                'texts_with_conflicts': texts_with_conflicts,
+                'details': conflict_report
+            })
+        else:
+            print(f"  ✅ No conflicts - both models agreed on all classifications", file=sys.stderr)
+    
+    # Merge results back into original order
     validated_idx = 0
     result_idx = 0
     for idx, text in enumerate(texts):
@@ -971,8 +1166,8 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
             # Already filled with all 0s, skip
             result_idx += 1
         else:
-            # Replace placeholder with validated result
-            results[result_idx] = validated_classifications[validated_idx]
+            # Replace placeholder with final result
+            results[result_idx] = final_classifications[validated_idx]
             validated_idx += 1
             result_idx += 1
     

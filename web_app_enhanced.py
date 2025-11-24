@@ -9,6 +9,8 @@ import io
 import os
 import sys
 import webbrowser
+import subprocess
+import platform
 from pathlib import Path
 from typing import Tuple
 from threading import Timer
@@ -81,21 +83,30 @@ def _trim_trailing_empty_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
     Trim only the trailing rows that are completely empty.
     We check ONLY the first column (answer column) - if it's empty, the row is empty,
     regardless of what's in the topic columns (which might have pre-filled 0s).
+    
+    Optimized: Works backwards from the end to find the last non-empty row quickly.
     """
     original_rows = len(df)
     if original_rows == 0:
         return df, 0
 
     # Check only the first column for content
+    # Work backwards from the end to find the last non-empty row
     first_col = df.iloc[:, 0]
-    non_empty_mask = first_col.apply(_cell_has_content)
+    last_non_empty_idx = -1
     
-    if non_empty_mask.any():
-        non_empty_positions = non_empty_mask.to_numpy().nonzero()[0]
-        last_pos = int(non_empty_positions[-1])
-        trimmed_df = df.iloc[: last_pos + 1].copy()
-    else:
+    # Start from the end and work backwards
+    for i in range(len(df) - 1, -1, -1):
+        if _cell_has_content(first_col.iloc[i]):
+            last_non_empty_idx = i
+            break
+    
+    if last_non_empty_idx == -1:
+        # All rows are empty, keep just the first row
         trimmed_df = df.iloc[:1].copy()
+    else:
+        # Keep everything up to and including the last non-empty row
+        trimmed_df = df.iloc[:last_non_empty_idx + 1].copy()
 
     rows_removed = original_rows - len(trimmed_df)
     return trimmed_df, rows_removed
@@ -388,9 +399,12 @@ def classify():
         
         # Run classification in a separate thread
         def run_classification():
-            # Redirect stdout to capture progress
+            # Redirect both stdout and stderr to capture progress
             old_stdout = sys.stdout
-            sys.stdout = ProgressCapture(session_id, queue)
+            old_stderr = sys.stderr
+            progress_capture = ProgressCapture(session_id, queue)
+            sys.stdout = progress_capture
+            sys.stderr = progress_capture  # Also capture stderr for progress messages
             
             try:
                 queue.put(f"Starting classification...")
@@ -419,10 +433,13 @@ def classify():
                 queue.put("DONE")
                 
             except Exception as e:
-                queue.put(f"❌ ERROR: {str(e)}")
+                import traceback
+                error_msg = f"❌ ERROR: {str(e)}\n{traceback.format_exc()}"
+                queue.put(error_msg)
                 queue.put("ERROR")
             finally:
                 sys.stdout = old_stdout
+                sys.stderr = old_stderr
                 # Clean up cached DataFrame after processing
                 if session_id in dataframe_cache:
                     del dataframe_cache[session_id]
@@ -489,8 +506,37 @@ def status():
 
 
 def open_browser():
-    """Open browser after a short delay."""
-    webbrowser.open('http://127.0.0.1:5000')
+    """Open browser after a short delay. On Windows, specifically use Chrome if available, otherwise use default browser."""
+    url = 'http://127.0.0.1:5000'
+    
+    # On Windows, try to use Chrome specifically
+    if platform.system() == 'Windows':
+        chrome_paths = [
+            r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+            r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
+            os.path.expanduser(r'~\AppData\Local\Google\Chrome\Application\chrome.exe'),
+        ]
+        
+        chrome_path = None
+        for path in chrome_paths:
+            if os.path.exists(path):
+                chrome_path = path
+                break
+        
+        if chrome_path:
+            try:
+                subprocess.Popen([chrome_path, url])
+                return
+            except Exception as e:
+                print(f"Warning: Could not open Chrome at {chrome_path}: {e}", file=sys.stderr)
+                print("Falling back to default browser...", file=sys.stderr)
+                # Fall through to default browser
+        else:
+            # Chrome not found, use default browser
+            print("Chrome not found, using default browser...", file=sys.stderr)
+    
+    # Default behavior: use system default browser (works on macOS and Linux, or Windows fallback)
+    webbrowser.open(url)
 
 
 if __name__ == '__main__':
