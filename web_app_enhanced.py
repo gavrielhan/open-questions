@@ -10,6 +10,7 @@ import os
 import sys
 import webbrowser
 from pathlib import Path
+from typing import Tuple
 from threading import Timer
 from datetime import datetime
 from queue import Queue
@@ -37,6 +38,9 @@ ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
 # Store for progress messages per session
 progress_queues = {}
 
+# Store DataFrames in memory per session (avoids re-reading large files)
+dataframe_cache = {}
+
 
 def allowed_file(filename: str) -> bool:
     """Check if file has an allowed extension."""
@@ -63,13 +67,47 @@ def column_index_to_letter(index: int) -> str:
     return letter
 
 
+def _cell_has_content(value) -> bool:
+    """Return True if the cell contains any meaningful content."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    return not pd.isna(value)
+
+
+def _trim_trailing_empty_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    """
+    Trim only the trailing rows that are completely empty.
+    We check ONLY the first column (answer column) - if it's empty, the row is empty,
+    regardless of what's in the topic columns (which might have pre-filled 0s).
+    """
+    original_rows = len(df)
+    if original_rows == 0:
+        return df, 0
+
+    # Check only the first column for content
+    first_col = df.iloc[:, 0]
+    non_empty_mask = first_col.apply(_cell_has_content)
+    
+    if non_empty_mask.any():
+        non_empty_positions = non_empty_mask.to_numpy().nonzero()[0]
+        last_pos = int(non_empty_positions[-1])
+        trimmed_df = df.iloc[: last_pos + 1].copy()
+    else:
+        trimmed_df = df.iloc[:1].copy()
+
+    rows_removed = original_rows - len(trimmed_df)
+    return trimmed_df, rows_removed
+
+
 def read_file(filepath: Path, sheet_name=None):
     """Read Excel or CSV file and return DataFrame and available sheets."""
     extension = filepath.suffix.lower()
     
     if extension == '.csv':
-        df = pd.read_csv(filepath)
-        return df, ['Sheet1']  # CSV has only one sheet
+        df = pd.read_csv(filepath, dtype=str, low_memory=False)
+        sheet_names = ['Sheet1']
     elif extension in ['.xlsx', '.xls']:
         # Get all sheet names
         xl_file = pd.ExcelFile(filepath)
@@ -80,10 +118,14 @@ def read_file(filepath: Path, sheet_name=None):
             df = pd.read_excel(filepath, sheet_name=sheet_name)
         else:
             df = pd.read_excel(filepath, sheet_name=0)
-        
-        return df, sheet_names
     else:
         raise ValueError(f"Unsupported file type: {extension}")
+    
+    df, rows_removed = _trim_trailing_empty_rows(df)
+    if rows_removed > 0:
+        print(f"Removed {rows_removed} trailing empty rows")
+    
+    return df, sheet_names, rows_removed
 
 
 class ProgressCapture:
@@ -134,8 +176,25 @@ def upload_file():
         input_path = app.config['UPLOAD_FOLDER'] / f"{session_id}_{filename}"
         file.save(input_path)
         
-        # Read file and get metadata
-        df, sheet_names = read_file(input_path)
+        # Read file and get metadata (always reads first sheet for Excel)
+        df, sheet_names, rows_removed = read_file(input_path)
+        
+        # Cache the DataFrame with the default sheet name
+        default_sheet = sheet_names[0] if sheet_names else None
+        
+        # Always use session_id for CSV (which has 'Sheet1' as placeholder)
+        # For Excel, use session_id_sheetname
+        if default_sheet and default_sheet != 'Sheet1':
+            cache_key = f"{session_id}_{default_sheet}"
+        else:
+            cache_key = session_id
+        
+        dataframe_cache[cache_key] = df
+        
+        # Store which sheet is currently cached
+        session['current_sheet'] = default_sheet
+        
+        print(f"DEBUG: Cached with key: {cache_key}, current_sheet: {default_sheet}")
         
         # Get column information
         columns = df.columns.tolist()
@@ -151,19 +210,60 @@ def upload_file():
         # Store file info in session
         session['uploaded_file'] = str(input_path)
         session['original_filename'] = filename
+        session['sheet_names'] = sheet_names
         
         return jsonify({
             'success': True,
             'session_id': session_id,
             'filename': filename,
             'sheets': sheet_names,
+            'default_sheet': default_sheet,
             'columns': column_info,
             'num_rows': len(df),
-            'num_columns': len(columns)
+            'num_columns': len(columns),
+            'rows_removed': rows_removed
         })
     
     except Exception as e:
         return jsonify({'error': f'Error processing file: {str(e)}'}), 500
+
+
+@app.route('/load_sheet', methods=['POST'])
+def load_sheet():
+    """Load a different sheet from Excel file."""
+    try:
+        data = request.json
+        sheet_name = data.get('sheet_name')
+        
+        if 'session_id' not in session or 'uploaded_file' not in session:
+            return jsonify({'error': 'No file uploaded'}), 400
+        
+        session_id = session['session_id']
+        filepath = Path(session['uploaded_file'])
+        
+        if not filepath.exists():
+            return jsonify({'error': 'Uploaded file not found'}), 400
+        
+        # Read the new sheet
+        df, _, rows_removed = read_file(filepath, sheet_name)
+        
+        # Update cache with new sheet data
+        cache_key = f"{session_id}_{sheet_name}"
+        dataframe_cache[cache_key] = df
+        
+        # Update current sheet in session
+        session['current_sheet'] = sheet_name
+        
+        return jsonify({
+            'success': True,
+            'sheet_name': sheet_name,
+            'num_rows': len(df),
+            'num_columns': len(df.columns),
+            'rows_removed': rows_removed
+        })
+    
+    except Exception as e:
+        return jsonify({'error': f'Error loading sheet: {str(e)}'}), 500
 
 
 @app.route('/preview', methods=['POST'])
@@ -176,15 +276,28 @@ def preview_data():
         topic_start = data.get('topic_start_column')
         topic_end = data.get('topic_end_column')
         
-        if 'uploaded_file' not in session:
+        if 'session_id' not in session:
             return jsonify({'error': 'No file uploaded'}), 400
         
-        filepath = Path(session['uploaded_file'])
-        if not filepath.exists():
-            return jsonify({'error': 'Uploaded file not found'}), 400
+        session_id = session['session_id']
         
-        # Read the specified sheet
-        df, _ = read_file(filepath, sheet_name)
+        # Get the current loaded sheet from session
+        current_sheet = session.get('current_sheet')
+        
+        # Build cache key based on current sheet (must match upload logic)
+        if current_sheet and current_sheet != 'Sheet1':
+            cache_key = f"{session_id}_{current_sheet}"
+        else:
+            cache_key = session_id
+        
+        print(f"DEBUG: Looking for cache key: {cache_key}, current_sheet: {current_sheet}")
+        print(f"DEBUG: Available cache keys: {list(dataframe_cache.keys())}")
+        
+        # Use the cached DataFrame for the currently loaded sheet
+        if cache_key not in dataframe_cache:
+            return jsonify({'error': 'Data not available. Please re-upload or select a sheet.'}), 400
+        
+        df = dataframe_cache[cache_key]
         
         # Convert column letters to indices
         answer_idx = column_letter_to_index(answer_col)
@@ -243,13 +356,16 @@ def classify():
             return jsonify({'error': 'No file uploaded'}), 400
         
         session_id = session.get('session_id')
-        filepath = Path(session['uploaded_file'])
         
         # Initialize progress queue for this session
         progress_queues[session_id] = Queue()
         
-        # Read the file
-        df, _ = read_file(filepath, sheet_name)
+        # Use cached DataFrame if available, otherwise read the file
+        if session_id in dataframe_cache:
+            df = dataframe_cache[session_id].copy()  # Use copy to avoid modifying cached version
+        else:
+            filepath = Path(session['uploaded_file'])
+            df, _, _ = read_file(filepath, sheet_name)
         
         # Strip whitespace from column names
         df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
@@ -307,6 +423,9 @@ def classify():
                 queue.put("ERROR")
             finally:
                 sys.stdout = old_stdout
+                # Clean up cached DataFrame after processing
+                if session_id in dataframe_cache:
+                    del dataframe_cache[session_id]
         
         # Start classification thread
         thread = threading.Thread(target=run_classification)

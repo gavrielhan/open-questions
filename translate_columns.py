@@ -31,6 +31,23 @@ class OpenAIConfig:
     batch_size: int = 10
     parallel_workers: int = 2
     request_delay_seconds: float = 0.5
+    # Azure AI Foundry config
+    api_version: str = "2024-12-01-preview"  # Azure API version
+    
+    def is_azure(self) -> bool:
+        """Check if this is an Azure AI Foundry endpoint."""
+        return "azure" in self.api_base_url.lower() or "cognitiveservices" in self.api_base_url.lower()
+    
+    def get_chat_completions_url(self) -> str:
+        """Get the correct chat completions endpoint URL based on provider."""
+        base = self.api_base_url.rstrip("/")
+        if self.is_azure():
+            # Azure OpenAI format: /deployments/{deployment}/chat/completions?api-version={version}
+            # Note: No /openai prefix for cognitiveservices.azure.com endpoints
+            return f"{base}/deployments/{self.model}/chat/completions?api-version={self.api_version}"
+        else:
+            # LiteLLM or standard OpenAI format
+            return f"{base}/v1/chat/completions"
 
     @classmethod
     def from_env(cls) -> "OpenAIConfig":
@@ -46,6 +63,7 @@ class OpenAIConfig:
             or "https://api.openai.com"
         )
         model = os.getenv("MODEL") or os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini")
+        api_version = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
 
         return cls(
             api_key=api_key,
@@ -58,6 +76,7 @@ class OpenAIConfig:
             batch_size=int(os.getenv("TRANSLATE_BATCH_SIZE", "10")),
             parallel_workers=int(os.getenv("OPENAI_PARALLEL_WORKERS", "2")),
             request_delay_seconds=float(os.getenv("OPENAI_REQUEST_DELAY_SECONDS", "0.5")),
+            api_version=api_version,
         )
 
 
@@ -75,7 +94,8 @@ def translate_text(text: str, config: OpenAIConfig) -> str:
     if not text:
         return ""
     
-    url = config.api_base_url.rstrip("/") + "/v1/chat/completions"
+    # Use the correct endpoint URL based on provider (Azure or LiteLLM)
+    url = config.get_chat_completions_url()
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {config.api_key}"
@@ -88,8 +108,8 @@ def translate_text(text: str, config: OpenAIConfig) -> str:
         f"{text}"
     )
     
+    # Build payload - Azure doesn't need model in payload if it's in the URL
     payload = {
-        "model": config.model,
         "messages": [
             {
                 "role": "system",
@@ -100,6 +120,11 @@ def translate_text(text: str, config: OpenAIConfig) -> str:
         "max_tokens": config.max_tokens,
         "temperature": config.temperature
     }
+    
+    # For Azure, model is in the URL path, not in payload
+    # For LiteLLM/OpenAI, include model in payload
+    if not config.is_azure():
+        payload["model"] = config.model
     
     for attempt in range(1, config.max_retries + 1):
         try:

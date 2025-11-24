@@ -245,28 +245,53 @@
             border-radius: 10px;
             display: none;
             text-align: center;
+            font-size: 16px;
+            font-weight: 500;
+            position: relative;
+            z-index: 100;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
 
         .status.visible {
-            display: block;
+            display: block !important;
         }
 
         .status.success {
             background: #d4edda;
             color: #155724;
-            border: 1px solid #c3e6cb;
+            border: 2px solid #c3e6cb;
         }
 
         .status.error {
             background: #f8d7da;
             color: #721c24;
-            border: 1px solid #f5c6cb;
+            border: 2px solid #f5c6cb;
         }
 
         .status.info {
             background: #d1ecf1;
             color: #0c5460;
-            border: 1px solid #bee5eb;
+            border: 2px solid #bee5eb;
+            max-height: none !important;
+            overflow: visible !important;
+        }
+        
+        /* Ensure previewInfo allows scrolling inside topic-list */
+        #previewInfo {
+            max-height: none !important;
+            overflow: visible !important;
+            display: block !important;
         }
 
         .spinner {
@@ -299,54 +324,65 @@
             margin-left: 10px;
         }
 
-        /* Topic list styling with RTL support */
+        /* Topic list styling with RTL support - FORCED SCROLLING */
         .topic-list {
             background: white;
             padding: 15px;
             border-radius: 8px;
             margin-top: 10px;
-            max-height: 200px;
-            min-height: 100px;
-            overflow-y: scroll;
-            overflow-x: hidden;
-            border: 1px solid #e0e0e0;
+            height: 250px !important;  /* Fixed height */
+            overflow-y: scroll !important;  /* Always show scrollbar */
+            overflow-x: hidden !important;
+            border: 2px solid #667eea !important;
+            display: block !important;
+            width: 100% !important;
+            box-sizing: border-box !important;
+            -webkit-overflow-scrolling: touch !important;
+            /* Remove position relative - it can interfere */
         }
 
-        /* Custom scrollbar styling - Always visible */
+        /* Custom scrollbar styling - ALWAYS VISIBLE AND FUNCTIONAL */
         .topic-list::-webkit-scrollbar {
-            width: 10px;
+            width: 12px !important;
+            display: block !important;
         }
 
         .topic-list::-webkit-scrollbar-track {
-            background: #f1f1f1;
-            border-radius: 5px;
-            margin: 5px 0;
+            background: #e0e0e0 !important;
+            border-radius: 6px !important;
         }
 
         .topic-list::-webkit-scrollbar-thumb {
-            background: #667eea;
-            border-radius: 5px;
-            border: 2px solid #f1f1f1;
+            background: #667eea !important;
+            border-radius: 6px !important;
+            border: 3px solid #ffffff !important;
+            min-height: 40px !important;
         }
 
         .topic-list::-webkit-scrollbar-thumb:hover {
-            background: #764ba2;
+            background: #764ba2 !important;
         }
 
         /* Firefox scrollbar styling */
         .topic-list {
-            scrollbar-width: thin;
-            scrollbar-color: #667eea #f1f1f1;
+            scrollbar-width: auto !important;
+            scrollbar-color: #667eea #e0e0e0 !important;
         }
 
         .topic-item {
-            padding: 8px 0;
+            padding: 12px 0;  /* More padding for better visibility */
             border-bottom: 1px solid #f0f0f0;
-            line-height: 1.6;
+            line-height: 1.8;
+            min-height: 40px;  /* Ensure items have height */
         }
 
         .topic-item:last-child {
             border-bottom: none;
+            padding-bottom: 0;
+        }
+        
+        .topic-item:first-child {
+            padding-top: 0;
         }
 
         /* Auto-detect RTL for Hebrew text */
@@ -384,6 +420,10 @@
                 <strong id="fileName"></strong><br>
                 <span id="fileStats"></span>
             </div>
+            
+            <!-- Upload Status and Spinner (right after Step 1) -->
+            <div class="spinner" id="spinner"></div>
+            <div class="status" id="status"></div>
         </div>
 
         <!-- Step 2: Select Sheet (if Excel) -->
@@ -398,6 +438,10 @@
                     <option value="">-- Select a sheet --</option>
                 </select>
             </div>
+            
+            <!-- Sheet loading indicator -->
+            <div class="spinner" id="sheetSpinner"></div>
+            <div class="status" id="sheetStatus"></div>
         </div>
 
         <!-- Step 3: Select Columns -->
@@ -449,9 +493,6 @@
 
         <!-- Progress Console -->
         <div class="progress-console" id="progressConsole"></div>
-
-        <div class="spinner" id="spinner"></div>
-        <div class="status" id="status"></div>
     </div>
 
     <script>
@@ -477,6 +518,8 @@
         const progressConsole = document.getElementById('progressConsole');
         const spinner = document.getElementById('spinner');
         const status = document.getElementById('status');
+        const sheetSpinner = document.getElementById('sheetSpinner');
+        const sheetStatus = document.getElementById('sheetStatus');
 
         // Step management
         function activateStep(stepNum) {
@@ -516,8 +559,14 @@
             const formData = new FormData();
             formData.append('file', file);
 
+            // Show processing message immediately
+            console.log('Showing processing message...');
+            status.className = 'status info visible';
+            status.textContent = '⏳ Processing file and removing empty rows...';
+            status.style.display = 'block';  // Force display
             spinner.classList.add('visible');
-            status.classList.remove('visible');
+            
+            console.log('Status element:', status.className, status.textContent);
 
             try {
                 const response = await fetch('/upload', {
@@ -536,10 +585,7 @@
                     fileName.textContent = `📄 ${result.filename}`;
                     fileStats.textContent = `${result.num_rows} rows × ${result.num_columns} columns`;
                     fileInfo.classList.add('visible');
-
-                    completeStep(1);
-                    activateStep(2);
-
+                    
                     // Populate sheet selector
                     sheetSelect.innerHTML = '';
                     sheets.forEach(sheet => {
@@ -549,7 +595,28 @@
                         sheetSelect.appendChild(option);
                     });
 
-                    // Auto-select if only one sheet
+                    // Set which sheet was loaded during upload
+                    const defaultSheet = result.default_sheet || sheets[0] || 'Sheet1';
+                    currentLoadedSheet = defaultSheet;
+                    
+                    // Update status to show completion with details
+                    status.className = 'status success visible';
+                    if (result.rows_removed > 0) {
+                        status.textContent = `✅ Loaded "${defaultSheet}" - Removed ${result.rows_removed} trailing empty rows.`;
+                    } else {
+                        status.textContent = `✅ Loaded "${defaultSheet}" successfully!`;
+                    }
+                    
+                    // Show sheet count if multiple sheets
+                    if (sheets.length > 1) {
+                        status.textContent += ` (${sheets.length} sheets available)`;
+                    }
+                    setTimeout(() => status.classList.remove('visible'), 5000);
+
+                    completeStep(1);
+                    activateStep(2);
+
+                    // Auto-select if only one sheet (will not reload since it's already loaded)
                     if (sheets.length === 1) {
                         sheetSelect.value = sheets[0];
                         handleSheetSelection();
@@ -565,12 +632,66 @@
         }
 
         // Sheet selection
+        let currentLoadedSheet = null;  // Track which sheet is currently loaded
+        
         sheetSelect.addEventListener('change', handleSheetSelection);
 
-        function handleSheetSelection() {
-            if (sheetSelect.value) {
+        async function handleSheetSelection() {
+            const selectedSheet = sheetSelect.value;
+            if (!selectedSheet) return;
+            
+            // If this is the same sheet that was already loaded during upload, just move to next step
+            if (selectedSheet === currentLoadedSheet) {
                 completeStep(2);
                 activateStep(3);
+                return;
+            }
+            
+            // Different sheet selected - need to load it
+            sheetSpinner.classList.add('visible');
+            sheetStatus.className = 'status info visible';
+            sheetStatus.textContent = `⏳ Loading sheet "${selectedSheet}" and removing empty rows...`;
+            
+            try {
+                // Call endpoint to load the new sheet
+                const response = await fetch('/load_sheet', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sheet_name: selectedSheet
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok && result.success) {
+                    // Sheet loaded successfully
+                    currentLoadedSheet = selectedSheet;
+                    
+                    // Update displayed stats to reflect the newly loaded sheet
+                    if (result.num_rows !== undefined && result.num_columns !== undefined) {
+                        fileStats.textContent = `${result.num_rows} rows × ${result.num_columns} columns`;
+                    }
+                    
+                    sheetStatus.className = 'status success visible';
+                    if (result.rows_removed > 0) {
+                        sheetStatus.textContent = `✅ Loaded "${selectedSheet}" - Removed ${result.rows_removed} trailing empty rows.`;
+                    } else {
+                        sheetStatus.textContent = `✅ Sheet "${selectedSheet}" loaded successfully!`;
+                    }
+                    setTimeout(() => sheetStatus.classList.remove('visible'), 4000);
+                    
+                    completeStep(2);
+                    activateStep(3);
+                } else {
+                    sheetStatus.className = 'status error visible';
+                    sheetStatus.textContent = `❌ Error loading sheet: ${result.error || 'Unknown error'}`;
+                }
+            } catch (error) {
+                sheetStatus.className = 'status error visible';
+                sheetStatus.textContent = `❌ Error: ${error.message}`;
+            } finally {
+                sheetSpinner.classList.remove('visible');
             }
         }
 
@@ -586,7 +707,9 @@
                 return;
             }
 
-            spinner.classList.add('visible');
+            // No spinner needed - using cached data for instant preview!
+            previewButton.disabled = true;
+            previewButton.textContent = 'Loading Preview...';
 
             try {
                 const response = await fetch('/preview', {
@@ -618,17 +741,64 @@
                     }
 
                     // Format topic columns with proper numbering and RTL support
-                    let topicListHTML = '<div class="topic-list">';
-                    result.topic_columns_formatted.forEach(topic => {
+                    // Create a properly scrollable div with pointer events enabled
+                    let topicListHTML = `
+                        <div id="scrollableTopicList" style="
+                            height: 300px !important; 
+                            overflow-y: scroll !important; 
+                            overflow-x: hidden !important; 
+                            border: 2px solid #667eea !important; 
+                            padding: 15px !important; 
+                            background: white !important; 
+                            border-radius: 8px !important; 
+                            margin-top: 10px !important; 
+                            display: block !important; 
+                            box-sizing: border-box !important;
+                            cursor: default !important;
+                            pointer-events: auto !important;
+                            -webkit-overflow-scrolling: touch !important;
+                        ">
+                            <div style="min-height: 450px;">
+                    `;
+                    
+                    result.topic_columns_formatted.forEach((topic, index) => {
                         const isHebrew = hasHebrew(topic);
                         const dirAttr = isHebrew ? ' dir="rtl"' : '';
-                        topicListHTML += `<div class="topic-item"${dirAttr}>${topic}</div>`;
+                        topicListHTML += `<div style="padding: 15px 0 !important; border-bottom: 1px solid #f0f0f0 !important; min-height: 50px !important; line-height: 1.8 !important;"${dirAttr}>${topic}</div>`;
                     });
-                    topicListHTML += '</div>';
+                    
+                    topicListHTML += `
+                            </div>
+                        </div>
+                    `;
+                    
+                    // Debug: log to console
+                    console.log('Number of topics:', result.topic_columns_formatted.length);
+                    console.log('Scrollable element will be created');
+                    
+                    // After adding to DOM, ensure it's scrollable
+                    setTimeout(() => {
+                        const scrollDiv = document.getElementById('scrollableTopicList');
+                        if (scrollDiv) {
+                            console.log('Scroll element height:', scrollDiv.scrollHeight, 'vs container:', scrollDiv.clientHeight);
+                            console.log('Is scrollable:', scrollDiv.scrollHeight > scrollDiv.clientHeight);
+                            
+                            // Force scroll behavior
+                            scrollDiv.addEventListener('wheel', function(e) {
+                                if (scrollDiv.scrollHeight > scrollDiv.clientHeight) {
+                                    e.stopPropagation();
+                                }
+                            });
+                        }
+                    }, 100);
 
                     previewInfo.innerHTML = `
-                        <strong>Answer Column:</strong> ${result.answer_column}<br>
-                        <strong>Topic Columns (${result.num_topics} topics):</strong>
+                        <div style="margin-bottom: 10px;">
+                            <strong>Answer Column:</strong> ${result.answer_column}
+                        </div>
+                        <div style="margin-bottom: 5px;">
+                            <strong>Topic Columns (${result.num_topics} topics):</strong>
+                        </div>
                         ${topicListHTML}
                     `;
 
@@ -641,7 +811,8 @@
             } catch (error) {
                 showStatus('error', `❌ Error: ${error.message}`);
             } finally {
-                spinner.classList.remove('visible');
+                previewButton.disabled = false;
+                previewButton.textContent = 'Preview Selection';
             }
         });
 
