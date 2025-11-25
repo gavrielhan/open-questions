@@ -327,7 +327,7 @@ def _classify_with_deepseek(inputs: dict, topics: Sequence[str], config: OpenAIC
         "- Use integers 0 or 1 only. 1 means the topic is clearly mentioned, 0 otherwise.\n"
         "- If uncertain, choose 0.\n"
         "- Include every topic exactly once per row and use the topic names exactly as provided.\n"
-        "- Ensure the YAML is strictly valid and properly indented."
+        "- Ensure the YAML is strictly valid and properly indented. Do not only look for keywords!"
     )
     
     user_prompt = (
@@ -424,7 +424,7 @@ def _resolve_conflict_with_judge(
         "You must respond with ONLY a single digit: 0 or 1.\n"
         "- 1 = The topic IS clearly mentioned or discussed in the text\n"
         "- 0 = The topic is NOT clearly mentioned or discussed in the text\n\n"
-        "Be rigorous: only return 1 if the topic is explicitly present, not merely implied."
+        "Be rigorous: only return 1 if the topic is explicitly present, not merely implied, and do not only look for keywords!"
     )
     
     user_prompt = (
@@ -433,9 +433,9 @@ def _resolve_conflict_with_judge(
         f"**Question context:** {question}\n\n"
         f"**Text to analyze (Hebrew):**\n{text}\n\n"
         f"**Topic in question:** {topic}\n\n"
-        f"**Classifier A (GPT-5.1) says:** {gpt_value} ({'topic IS present' if gpt_value == 1 else 'topic is NOT present'})\n"
-        f"**Classifier B (DeepSeek) says:** {deepseek_value} ({'topic IS present' if deepseek_value == 1 else 'topic is NOT present'})\n\n"
-        f"After careful analysis of the text, is the topic '{topic}' clearly mentioned or discussed?\n\n"
+        f"**Classifier A says:** {gpt_value} ({'topic IS present' if gpt_value == 1 else 'topic is NOT present'})\n"
+        f"**Classifier B says:** {deepseek_value} ({'topic IS present' if deepseek_value == 1 else 'topic is NOT present'})\n\n"
+        f"After careful analysis of the text, is the topic '{topic}' clearly mentioned or discussed? Do not only look for keywords!\n\n"
         f"Respond with ONLY: 0 or 1"
     )
     

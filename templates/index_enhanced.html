@@ -859,41 +859,62 @@
         });
 
         // Poll for progress updates
+        // Slow polling (5s) during file scanning, fast polling (500ms) during classification
         function pollProgress(sid) {
-            const interval = setInterval(async () => {
-                try {
-                    const response = await fetch(`/progress/${sid}`);
-                    const result = await response.json();
+            let isProcessingStarted = false;
+            let currentInterval = null;
+            
+            function doPoll() {
+                fetch(`/progress/${sid}`)
+                    .then(response => response.json())
+                    .then(result => {
+                        // Add new messages
+                        result.messages.forEach(msg => {
+                            const div = document.createElement('div');
+                            div.className = 'progress-line';
+                            div.textContent = msg;
+                            progressConsole.appendChild(div);
+                            
+                            // Detect when actual classification starts (after file scanning)
+                            // "Processing X rows" indicates scanning is done
+                            if (msg.includes('Processing') && msg.includes('rows')) {
+                                if (!isProcessingStarted) {
+                                    isProcessingStarted = true;
+                                    // Switch to fast polling
+                                    if (currentInterval) {
+                                        clearInterval(currentInterval);
+                                        currentInterval = setInterval(doPoll, 500);  // Fast: 500ms
+                                    }
+                                }
+                            }
+                        });
 
-                    // Add new messages
-                    result.messages.forEach(msg => {
-                        const div = document.createElement('div');
-                        div.className = 'progress-line';
-                        div.textContent = msg;
-                        progressConsole.appendChild(div);
-                    });
+                        // Scroll to bottom
+                        progressConsole.scrollTop = progressConsole.scrollHeight;
 
-                    // Scroll to bottom
-                    progressConsole.scrollTop = progressConsole.scrollHeight;
-
-                    // Check if done
-                    if (result.done) {
-                        clearInterval(interval);
-                        runButton.disabled = false;
-                        
-                        if (result.error) {
-                            showStatus('error', '❌ Classification failed. Check the console above for details.');
-                        } else {
-                            showStatus('success', '✅ Classification completed! Check your Desktop for the output CSV file.');
-                            completeStep(4);
+                        // Check if done
+                        if (result.done) {
+                            if (currentInterval) clearInterval(currentInterval);
+                            runButton.disabled = false;
+                            
+                            if (result.error) {
+                                showStatus('error', '❌ Classification failed. Check the console above for details.');
+                            } else {
+                                showStatus('success', '✅ Classification completed! Check your Desktop for the output CSV file.');
+                                completeStep(4);
+                            }
                         }
-                    }
-                } catch (error) {
-                    clearInterval(interval);
-                    showStatus('error', `❌ Error polling progress: ${error.message}`);
-                    runButton.disabled = false;
-                }
-            }, 500);  // Poll every 500ms
+                    })
+                    .catch(error => {
+                        if (currentInterval) clearInterval(currentInterval);
+                        showStatus('error', `❌ Error polling progress: ${error.message}`);
+                        runButton.disabled = false;
+                    });
+            }
+            
+            // Start with slow polling during file scanning (5 seconds)
+            currentInterval = setInterval(doPoll, 5000);
+            doPoll();  // Immediate first poll
         }
 
         function showStatus(type, message) {

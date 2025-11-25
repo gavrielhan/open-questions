@@ -133,11 +133,17 @@ def _get_excel_sheet_columns(filepath: Path, sheet_name: str) -> List[str]:
 # EFFICIENT DATA LOADING WITH BOTTOM-UP TRIMMING (Only at classification time)
 # ============================================================================
 
-def _find_last_non_empty_row_csv(filepath: Path) -> int:
+def _find_last_non_empty_row_csv(filepath: Path, answer_col_index: int = 0) -> int:
     """
     Find the last row with content in a CSV file.
-    Scans bottom-up - very fast for files with trailing empty rows.
-    Returns: 1-based row number of last non-empty row (excluding header)
+    Scans bottom-up on the ANSWER COLUMN - finds trailing empty rows correctly.
+    Empty rows in the middle are preserved.
+    
+    Args:
+        filepath: Path to CSV file
+        answer_col_index: Which column to check (user's answer column)
+    
+    Returns: Number of data rows (excluding header)
     """
     with open(filepath, 'r', encoding='utf-8', errors='replace', newline='') as f:
         rows = list(csv.reader(f))
@@ -148,57 +154,76 @@ def _find_last_non_empty_row_csv(filepath: Path) -> int:
     # Scan from bottom up (skip header at index 0)
     for i in range(len(rows) - 1, 0, -1):
         row = rows[i]
-        # Check first column only (answer column)
-        if row and row[0].strip() not in ('', 'NaN', 'nan', 'None', 'null'):
-            return i  # Return 1-based row number (i = row index, header is 0)
+        # Check the answer column (not always column 0)
+        if row and len(row) > answer_col_index:
+            val = row[answer_col_index].strip()
+            if val not in ('', 'NaN', 'nan', 'None', 'null'):
+                return i  # Return row count (i = number of data rows since header is 0)
     
     return 0
 
 
-def _find_last_non_empty_row_excel(filepath: Path, sheet_name: str) -> int:
+def _find_last_non_empty_row_excel(filepath: Path, sheet_name: str, answer_col_index: int = 0) -> int:
     """
     Find the last row with content in an Excel sheet.
-    Uses openpyxl read_only mode and scans bottom-up.
-    Returns: 1-based row number of last non-empty row (excluding header)
+    Scans bottom-up on the ANSWER COLUMN - finds trailing empty rows correctly.
+    Empty rows in the middle are preserved.
+    
+    OPTIMIZED: Reads only the answer column using pandas (usecols=[answer_col_index]).
+    Pandas is highly optimized for single column reads.
+    Then scans backwards in memory - this correctly handles gaps.
+    
+    Args:
+        filepath: Path to Excel file
+        sheet_name: Name of sheet to read
+        answer_col_index: Which column to check (user's answer column)
+    
+    Returns: Number of data rows (excluding header)
     """
-    from openpyxl import load_workbook
+    # Read only the answer column - pandas is fast for single column reads
+    df_col = pd.read_excel(filepath, sheet_name=sheet_name, usecols=[answer_col_index], dtype=str)
     
-    wb = load_workbook(filepath, read_only=True, data_only=True)
-    ws = wb[sheet_name]
-    
-    max_row = ws.max_row
-    if max_row <= 1:
-        wb.close()
+    if len(df_col) == 0:
         return 0
     
-    # Scan bottom-up, checking only first column (answer column)
-    last_non_empty = 0
-    for row_num in range(max_row, 1, -1):  # Skip header (row 1)
-        cell_value = ws.cell(row=row_num, column=1).value
-        if cell_value is not None:
-            if isinstance(cell_value, str):
-                if cell_value.strip() not in ('', 'NaN', 'nan', 'None', 'null'):
-                    last_non_empty = row_num - 1  # Convert to 0-based data row
-                    break
-            else:
-                last_non_empty = row_num - 1
-                break
+    # Get answer column values as a list
+    answer_col = df_col.iloc[:, 0].tolist()
     
-    wb.close()
-    return last_non_empty
+    # Scan backwards to find last non-empty row in the answer column
+    # This correctly handles empty rows in the middle - we only trim TRAILING empty rows
+    for i in range(len(answer_col) - 1, -1, -1):
+        val = answer_col[i]
+        if val is not None and not pd.isna(val):
+            if isinstance(val, str):
+                if val.strip() not in ('', 'NaN', 'nan', 'None', 'null'):
+                    return i + 1  # +1 because we want count of rows (1-based)
+            else:
+                return i + 1
+    
+    return 0
 
 
 def load_and_trim_for_classification(
     filepath: Path, 
     sheet_name: Optional[str] = None,
-    progress_callback=None
+    progress_callback=None,
+    answer_col_index: int = 0
 ) -> pd.DataFrame:
     """
     Load file and trim trailing empty rows EFFICIENTLY.
     This is called only when classification starts.
     
+    Uses the ANSWER COLUMN to determine trailing empty rows.
+    Empty rows in the middle of the data are preserved.
+    
     - For CSV: Finds last non-empty row first, then loads only that many rows
-    - For Excel: Same approach with openpyxl pre-scan
+    - For Excel: Same approach with pandas single-column read
+    
+    Args:
+        filepath: Path to file
+        sheet_name: Sheet name for Excel files
+        progress_callback: Function to report progress
+        answer_col_index: Which column contains answers (for trimming check)
     
     Returns: Trimmed DataFrame ready for classification
     """
@@ -208,7 +233,7 @@ def load_and_trim_for_classification(
         if progress_callback:
             progress_callback("Scanning for data rows...")
         
-        last_row = _find_last_non_empty_row_csv(filepath)
+        last_row = _find_last_non_empty_row_csv(filepath, answer_col_index)
         
         if progress_callback:
             progress_callback(f"Found {last_row} rows with data, loading...")
@@ -223,7 +248,7 @@ def load_and_trim_for_classification(
         if progress_callback:
             progress_callback(f"Scanning sheet '{sheet_name}' for data rows...")
         
-        last_row = _find_last_non_empty_row_excel(filepath, sheet_name)
+        last_row = _find_last_non_empty_row_excel(filepath, sheet_name, answer_col_index)
         
         if progress_callback:
             progress_callback(f"Found {last_row} rows with data, loading...")
@@ -519,12 +544,14 @@ def classify():
                 queue.put("Starting classification...")
                 queue.put(f"Model: {config.model}")
                 
-                # EFFICIENT LOADING: Uses bottom-up scan to find last non-empty row,
-                # then loads only the rows we need (not all 1M+ empty rows)
+                # EFFICIENT LOADING: Uses bottom-up scan on ANSWER COLUMN to find last non-empty row,
+                # then loads only the rows we need (not all 1M+ empty rows).
+                # Empty rows in the middle are preserved - only trailing empty rows are trimmed.
                 df = load_and_trim_for_classification(
                     filepath, 
                     current_sheet,
-                    progress_callback=lambda msg: queue.put(msg)
+                    progress_callback=lambda msg: queue.put(msg),
+                    answer_col_index=answer_idx  # Use the user's answer column for trimming check
                 )
                 
                 # Get column names
