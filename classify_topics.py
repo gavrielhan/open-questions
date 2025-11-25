@@ -532,15 +532,23 @@ def _compare_and_resolve_classifications(
         text_key = str(i)
         text = texts[i - 1]
         
-        gpt_class = gpt_results.get(text_key, {})
-        deepseek_class = deepseek_results.get(text_key, {})
+        # Safely get results, handling cases where YAML returned wrong type
+        gpt_raw = gpt_results.get(text_key, {}) if isinstance(gpt_results, dict) else {}
+        deepseek_raw = deepseek_results.get(text_key, {}) if isinstance(deepseek_results, dict) else {}
+        
+        # Ensure we have dicts, not strings
+        gpt_class = gpt_raw if isinstance(gpt_raw, dict) else {}
+        deepseek_class = deepseek_raw if isinstance(deepseek_raw, dict) else {}
         
         final_class: Dict[str, int] = {}
         text_conflicts: List[Dict] = []
         
         for topic in topics:
-            gpt_val = int(gpt_class.get(topic, 0) in (1, "1", True))
-            deepseek_val = int(deepseek_class.get(topic, 0) in (1, "1", True))
+            # Safely extract values, handling malformed responses
+            gpt_val_raw = gpt_class.get(topic, 0) if isinstance(gpt_class, dict) else 0
+            deepseek_val_raw = deepseek_class.get(topic, 0) if isinstance(deepseek_class, dict) else 0
+            gpt_val = int(gpt_val_raw in (1, "1", True))
+            deepseek_val = int(deepseek_val_raw in (1, "1", True))
             
             if gpt_val == deepseek_val:
                 # Agreement - use the agreed value
@@ -717,10 +725,11 @@ def _validate_with_direct_api(
                 print(f"❌ Repair failed, using initial classifications", file=sys.stderr)
                 return initial_classifications
         
-        # Ensure all topics are present
+        # Ensure all topics are present - handle case where result is not a dict
         validated = {}
+        result_dict = result if isinstance(result, dict) else {}
         for topic in topics:
-            value = result.get(topic, initial_classifications.get(topic, 0))
+            value = result_dict.get(topic, initial_classifications.get(topic, 0))
             validated[topic] = int(value in (1, "1", True))
         
         return validated
@@ -825,8 +834,9 @@ def _reevaluate_with_deepseek(
             
             result = repaired
         
-        # Get the value for this topic
-        value = result.get(topic, initial_value)
+        # Get the value for this topic - handle case where result is not a dict
+        result_dict = result if isinstance(result, dict) else {}
+        value = result_dict.get(topic, initial_value)
         return int(value in (1, "1", True)), True
         
     except Exception as exc:
@@ -1118,14 +1128,16 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
         print(f"  ⚠️  Using DeepSeek results only (GPT-5.1 failed)", file=sys.stderr)
         final_classifications = []
         for i in range(1, len(process_texts) + 1):
-            item = deepseek_results.get(str(i), {})
+            item_raw = deepseek_results.get(str(i), {}) if isinstance(deepseek_results, dict) else {}
+            item = item_raw if isinstance(item_raw, dict) else {}
             final_classifications.append({t: int(item.get(t, 0) in (1, "1", True)) for t in topics})
     elif deepseek_results is None:
         # Only GPT-5.1 succeeded - use its results
         print(f"  ⚠️  Using GPT-5.1 results only (DeepSeek failed)", file=sys.stderr)
         final_classifications = []
         for i in range(1, len(process_texts) + 1):
-            item = gpt_results.get(str(i), {})
+            item_raw = gpt_results.get(str(i), {}) if isinstance(gpt_results, dict) else {}
+            item = item_raw if isinstance(item_raw, dict) else {}
             final_classifications.append({t: int(item.get(t, 0) in (1, "1", True)) for t in topics})
     else:
         # Both succeeded - compare and resolve conflicts

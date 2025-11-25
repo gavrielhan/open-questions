@@ -562,7 +562,7 @@
             // Show processing message immediately
             console.log('Showing processing message...');
             status.className = 'status info visible';
-            status.textContent = '⏳ Processing file and removing empty rows...';
+            status.textContent = '⏳ Processing file...';
             status.style.display = 'block';  // Force display
             spinner.classList.add('visible');
             
@@ -583,7 +583,12 @@
                     columns = result.columns;
 
                     fileName.textContent = `📄 ${result.filename}`;
-                    fileStats.textContent = `${result.num_rows} rows × ${result.num_columns} columns`;
+                    // Row count may be null for Excel files (computed at classification time)
+                    if (result.num_rows !== null && result.num_rows !== undefined) {
+                        fileStats.textContent = `${result.num_rows} rows × ${result.num_columns} columns`;
+                    } else {
+                        fileStats.textContent = `${result.num_columns} columns`;
+                    }
                     fileInfo.classList.add('visible');
                     
                     // Populate sheet selector
@@ -601,11 +606,7 @@
                     
                     // Update status to show completion with details
                     status.className = 'status success visible';
-                    if (result.rows_removed > 0) {
-                        status.textContent = `✅ Loaded "${defaultSheet}" - Removed ${result.rows_removed} trailing empty rows.`;
-                    } else {
-                        status.textContent = `✅ Loaded "${defaultSheet}" successfully!`;
-                    }
+                    status.textContent = `✅ Loaded "${defaultSheet}" successfully!`;
                     
                     // Show sheet count if multiple sheets
                     if (sheets.length > 1) {
@@ -650,7 +651,7 @@
             // Different sheet selected - need to load it
             sheetSpinner.classList.add('visible');
             sheetStatus.className = 'status info visible';
-            sheetStatus.textContent = `⏳ Loading sheet "${selectedSheet}" and removing empty rows...`;
+            sheetStatus.textContent = `⏳ Loading sheet "${selectedSheet}"...`;
             
             try {
                 // Call endpoint to load the new sheet
@@ -668,17 +669,20 @@
                     // Sheet loaded successfully
                     currentLoadedSheet = selectedSheet;
                     
-                    // Update displayed stats to reflect the newly loaded sheet
-                    if (result.num_rows !== undefined && result.num_columns !== undefined) {
+                    // Update columns from the new sheet
+                    if (result.columns) {
+                        columns = result.columns;
+                    }
+                    
+                    // Update displayed stats (row count may be null for Excel)
+                    if (result.num_rows !== null && result.num_rows !== undefined) {
                         fileStats.textContent = `${result.num_rows} rows × ${result.num_columns} columns`;
+                    } else {
+                        fileStats.textContent = `${result.num_columns} columns`;
                     }
                     
                     sheetStatus.className = 'status success visible';
-                    if (result.rows_removed > 0) {
-                        sheetStatus.textContent = `✅ Loaded "${selectedSheet}" - Removed ${result.rows_removed} trailing empty rows.`;
-                    } else {
-                        sheetStatus.textContent = `✅ Sheet "${selectedSheet}" loaded successfully!`;
-                    }
+                    sheetStatus.textContent = `✅ Sheet "${selectedSheet}" loaded successfully!`;
                     setTimeout(() => sheetStatus.classList.remove('visible'), 4000);
                     
                     completeStep(2);

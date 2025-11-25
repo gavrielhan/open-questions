@@ -2,9 +2,16 @@
 """
 Enhanced Flask web application for Excel topic classification.
 Provides a web interface with file validation, column selection, and real-time progress.
+
+PERFORMANCE OPTIMIZATIONS:
+- Lazy loading: Never load full DataFrame until classification starts
+- Lightweight metadata: Use openpyxl/csv to get columns without pandas
+- Bottom-up trimming: Scan from end to find last non-empty row efficiently
+- No DataFrame caching during browse: Only store file path
 """
 from __future__ import annotations
 
+import csv
 import io
 import os
 import sys
@@ -12,7 +19,7 @@ import webbrowser
 import subprocess
 import platform
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List, Optional, Any
 from threading import Timer
 from datetime import datetime
 from queue import Queue
@@ -40,9 +47,6 @@ ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
 # Store for progress messages per session
 progress_queues = {}
 
-# Store DataFrames in memory per session (avoids re-reading large files)
-dataframe_cache = {}
-
 
 def allowed_file(filename: str) -> bool:
     """Check if file has an allowed extension."""
@@ -69,74 +73,178 @@ def column_index_to_letter(index: int) -> str:
     return letter
 
 
-def _cell_has_content(value) -> bool:
-    """Return True if the cell contains any meaningful content."""
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return value.strip() != ""
-    return not pd.isna(value)
+# ============================================================================
+# LIGHTWEIGHT METADATA EXTRACTION (No pandas, instant response)
+# ============================================================================
 
-
-def _trim_trailing_empty_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+def _get_csv_metadata(filepath: Path) -> Tuple[List[str], int]:
     """
-    Trim only the trailing rows that are completely empty.
-    We check ONLY the first column (answer column) - if it's empty, the row is empty,
-    regardless of what's in the topic columns (which might have pre-filled 0s).
-    
-    Optimized: Works backwards from the end to find the last non-empty row quickly.
+    Get CSV column headers and approximate row count WITHOUT loading into pandas.
+    Uses Python's csv module - very fast.
+    Returns: (column_names, estimated_row_count)
     """
-    original_rows = len(df)
-    if original_rows == 0:
-        return df, 0
+    with open(filepath, 'r', encoding='utf-8', errors='replace', newline='') as f:
+        reader = csv.reader(f)
+        columns = next(reader, [])
+        
+        # Quick row count estimate: count lines without parsing
+        # This is O(n) but very fast - just counting newlines
+        f.seek(0)
+        row_count = sum(1 for _ in f) - 1  # -1 for header
+        
+    return columns, max(0, row_count)
 
-    # Check only the first column for content
-    # Work backwards from the end to find the last non-empty row
-    first_col = df.iloc[:, 0]
-    last_non_empty_idx = -1
+
+def _get_excel_metadata(filepath: Path) -> Tuple[List[str], dict]:
+    """
+    Get Excel sheet names and column headers WITHOUT loading data.
+    Uses openpyxl in read_only mode - very fast.
+    Returns: (sheet_names, {sheet_name: column_names})
+    """
+    from openpyxl import load_workbook
     
-    # Start from the end and work backwards
-    for i in range(len(df) - 1, -1, -1):
-        if _cell_has_content(first_col.iloc[i]):
-            last_non_empty_idx = i
-            break
+    wb = load_workbook(filepath, read_only=True, data_only=True)
+    sheet_names = wb.sheetnames
     
-    if last_non_empty_idx == -1:
-        # All rows are empty, keep just the first row
-        trimmed_df = df.iloc[:1].copy()
-    else:
-        # Keep everything up to and including the last non-empty row
-        trimmed_df = df.iloc[:last_non_empty_idx + 1].copy()
-
-    rows_removed = original_rows - len(trimmed_df)
-    return trimmed_df, rows_removed
+    # Get columns from first sheet only (others loaded on demand)
+    first_sheet = wb[sheet_names[0]]
+    first_row = next(first_sheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
+    columns = [str(c) if c is not None else f"Column_{i}" for i, c in enumerate(first_row)]
+    
+    wb.close()
+    return sheet_names, {sheet_names[0]: columns}
 
 
-def read_file(filepath: Path, sheet_name=None):
-    """Read Excel or CSV file and return DataFrame and available sheets."""
+def _get_excel_sheet_columns(filepath: Path, sheet_name: str) -> List[str]:
+    """
+    Get column headers for a specific Excel sheet WITHOUT loading data.
+    """
+    from openpyxl import load_workbook
+    
+    wb = load_workbook(filepath, read_only=True, data_only=True)
+    ws = wb[sheet_name]
+    first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+    columns = [str(c) if c is not None else f"Column_{i}" for i, c in enumerate(first_row)]
+    wb.close()
+    return columns
+
+
+# ============================================================================
+# EFFICIENT DATA LOADING WITH BOTTOM-UP TRIMMING (Only at classification time)
+# ============================================================================
+
+def _find_last_non_empty_row_csv(filepath: Path) -> int:
+    """
+    Find the last row with content in a CSV file.
+    Scans bottom-up - very fast for files with trailing empty rows.
+    Returns: 1-based row number of last non-empty row (excluding header)
+    """
+    with open(filepath, 'r', encoding='utf-8', errors='replace', newline='') as f:
+        rows = list(csv.reader(f))
+    
+    if len(rows) <= 1:  # Only header or empty
+        return 0
+    
+    # Scan from bottom up (skip header at index 0)
+    for i in range(len(rows) - 1, 0, -1):
+        row = rows[i]
+        # Check first column only (answer column)
+        if row and row[0].strip() not in ('', 'NaN', 'nan', 'None', 'null'):
+            return i  # Return 1-based row number (i = row index, header is 0)
+    
+    return 0
+
+
+def _find_last_non_empty_row_excel(filepath: Path, sheet_name: str) -> int:
+    """
+    Find the last row with content in an Excel sheet.
+    Uses openpyxl read_only mode and scans bottom-up.
+    Returns: 1-based row number of last non-empty row (excluding header)
+    """
+    from openpyxl import load_workbook
+    
+    wb = load_workbook(filepath, read_only=True, data_only=True)
+    ws = wb[sheet_name]
+    
+    max_row = ws.max_row
+    if max_row <= 1:
+        wb.close()
+        return 0
+    
+    # Scan bottom-up, checking only first column (answer column)
+    last_non_empty = 0
+    for row_num in range(max_row, 1, -1):  # Skip header (row 1)
+        cell_value = ws.cell(row=row_num, column=1).value
+        if cell_value is not None:
+            if isinstance(cell_value, str):
+                if cell_value.strip() not in ('', 'NaN', 'nan', 'None', 'null'):
+                    last_non_empty = row_num - 1  # Convert to 0-based data row
+                    break
+            else:
+                last_non_empty = row_num - 1
+                break
+    
+    wb.close()
+    return last_non_empty
+
+
+def load_and_trim_for_classification(
+    filepath: Path, 
+    sheet_name: Optional[str] = None,
+    progress_callback=None
+) -> pd.DataFrame:
+    """
+    Load file and trim trailing empty rows EFFICIENTLY.
+    This is called only when classification starts.
+    
+    - For CSV: Finds last non-empty row first, then loads only that many rows
+    - For Excel: Same approach with openpyxl pre-scan
+    
+    Returns: Trimmed DataFrame ready for classification
+    """
     extension = filepath.suffix.lower()
     
     if extension == '.csv':
-        df = pd.read_csv(filepath, dtype=str, low_memory=False)
-        sheet_names = ['Sheet1']
-    elif extension in ['.xlsx', '.xls']:
-        # Get all sheet names
-        xl_file = pd.ExcelFile(filepath)
-        sheet_names = xl_file.sheet_names
+        if progress_callback:
+            progress_callback("Scanning for data rows...")
         
-        # Read specific sheet or first sheet
-        if sheet_name:
-            df = pd.read_excel(filepath, sheet_name=sheet_name)
+        last_row = _find_last_non_empty_row_csv(filepath)
+        
+        if progress_callback:
+            progress_callback(f"Found {last_row} rows with data, loading...")
+        
+        # Load only the rows we need
+        if last_row > 0:
+            df = pd.read_csv(filepath, nrows=last_row, dtype=str, low_memory=False)
         else:
-            df = pd.read_excel(filepath, sheet_name=0)
+            df = pd.read_csv(filepath, nrows=1, dtype=str, low_memory=False)
+            
+    elif extension in ('.xlsx', '.xls'):
+        if progress_callback:
+            progress_callback(f"Scanning sheet '{sheet_name}' for data rows...")
+        
+        last_row = _find_last_non_empty_row_excel(filepath, sheet_name)
+        
+        if progress_callback:
+            progress_callback(f"Found {last_row} rows with data, loading...")
+        
+        # Load only the rows we need
+        if last_row > 0:
+            df = pd.read_excel(filepath, sheet_name=sheet_name, nrows=last_row, dtype=str)
+        else:
+            df = pd.read_excel(filepath, sheet_name=sheet_name, nrows=1, dtype=str)
     else:
         raise ValueError(f"Unsupported file type: {extension}")
     
-    df, rows_removed = _trim_trailing_empty_rows(df)
-    if rows_removed > 0:
-        print(f"Removed {rows_removed} trailing empty rows")
+    # Clean column names
+    df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     
-    return df, sheet_names, rows_removed
+    if progress_callback:
+        progress_callback(f"Loaded {len(df)} rows × {len(df.columns)} columns")
+    
+    return df
+
+
 
 
 class ProgressCapture:
@@ -166,7 +274,12 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    """Handle file upload and validation."""
+    """
+    Handle file upload - LIGHTWEIGHT, NO DATAFRAME LOADING.
+    
+    Only extracts metadata (columns, sheets) using fast low-level parsing.
+    Full DataFrame loading happens only at classification time.
+    """
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
     
@@ -187,28 +300,24 @@ def upload_file():
         input_path = app.config['UPLOAD_FOLDER'] / f"{session_id}_{filename}"
         file.save(input_path)
         
-        # Read file and get metadata (always reads first sheet for Excel)
-        df, sheet_names, rows_removed = read_file(input_path)
+        extension = input_path.suffix.lower()
         
-        # Cache the DataFrame with the default sheet name
-        default_sheet = sheet_names[0] if sheet_names else None
-        
-        # Always use session_id for CSV (which has 'Sheet1' as placeholder)
-        # For Excel, use session_id_sheetname
-        if default_sheet and default_sheet != 'Sheet1':
-            cache_key = f"{session_id}_{default_sheet}"
+        # LIGHTWEIGHT METADATA EXTRACTION - No pandas, instant response
+        if extension == '.csv':
+            columns, row_count = _get_csv_metadata(input_path)
+            sheet_names = ['Sheet1']
+            default_sheet = 'Sheet1'
         else:
-            cache_key = session_id
+            # Excel file
+            sheet_names, columns_by_sheet = _get_excel_metadata(input_path)
+            default_sheet = sheet_names[0]
+            columns = columns_by_sheet.get(default_sheet, [])
+            row_count = None  # Not computed for Excel to save time
         
-        dataframe_cache[cache_key] = df
-        
-        # Store which sheet is currently cached
+        # Store metadata in session (NO DataFrame caching)
         session['current_sheet'] = default_sheet
         
-        print(f"DEBUG: Cached with key: {cache_key}, current_sheet: {default_sheet}")
-        
-        # Get column information
-        columns = df.columns.tolist()
+        # Build column info for frontend
         column_info = [
             {
                 'index': i,
@@ -230,9 +339,8 @@ def upload_file():
             'sheets': sheet_names,
             'default_sheet': default_sheet,
             'columns': column_info,
-            'num_rows': len(df),
-            'num_columns': len(columns),
-            'rows_removed': rows_removed
+            'num_rows': row_count,  # May be None for Excel (computed at classification time)
+            'num_columns': len(columns)
         })
     
     except Exception as e:
@@ -241,7 +349,12 @@ def upload_file():
 
 @app.route('/load_sheet', methods=['POST'])
 def load_sheet():
-    """Load a different sheet from Excel file."""
+    """
+    Switch to a different Excel sheet - LIGHTWEIGHT, NO DATAFRAME LOADING.
+    
+    Only extracts column headers using openpyxl.
+    Full DataFrame loading happens only at classification time.
+    """
     try:
         data = request.json
         sheet_name = data.get('sheet_name')
@@ -249,28 +362,33 @@ def load_sheet():
         if 'session_id' not in session or 'uploaded_file' not in session:
             return jsonify({'error': 'No file uploaded'}), 400
         
-        session_id = session['session_id']
         filepath = Path(session['uploaded_file'])
         
         if not filepath.exists():
             return jsonify({'error': 'Uploaded file not found'}), 400
         
-        # Read the new sheet
-        df, _, rows_removed = read_file(filepath, sheet_name)
+        # LIGHTWEIGHT: Get only column headers for this sheet
+        columns = _get_excel_sheet_columns(filepath, sheet_name)
         
-        # Update cache with new sheet data
-        cache_key = f"{session_id}_{sheet_name}"
-        dataframe_cache[cache_key] = df
-        
-        # Update current sheet in session
+        # Update current sheet in session (NO DataFrame caching)
         session['current_sheet'] = sheet_name
+        
+        # Build column info for frontend
+        column_info = [
+            {
+                'index': i,
+                'letter': column_index_to_letter(i),
+                'name': str(col)
+            }
+            for i, col in enumerate(columns)
+        ]
         
         return jsonify({
             'success': True,
             'sheet_name': sheet_name,
-            'num_rows': len(df),
-            'num_columns': len(df.columns),
-            'rows_removed': rows_removed
+            'columns': column_info,
+            'num_rows': None,  # Not computed to save time - happens at classification
+            'num_columns': len(columns)
         })
     
     except Exception as e:
@@ -279,7 +397,11 @@ def load_sheet():
 
 @app.route('/preview', methods=['POST'])
 def preview_data():
-    """Preview data from selected sheet and columns."""
+    """
+    Preview data from selected sheet and columns.
+    
+    LIGHTWEIGHT: Only loads first 5 rows for preview, not the entire file.
+    """
     try:
         data = request.json
         sheet_name = data.get('sheet_name')
@@ -287,28 +409,25 @@ def preview_data():
         topic_start = data.get('topic_start_column')
         topic_end = data.get('topic_end_column')
         
-        if 'session_id' not in session:
+        if 'uploaded_file' not in session:
             return jsonify({'error': 'No file uploaded'}), 400
         
-        session_id = session['session_id']
-        
-        # Get the current loaded sheet from session
+        filepath = Path(session['uploaded_file'])
         current_sheet = session.get('current_sheet')
         
-        # Build cache key based on current sheet (must match upload logic)
-        if current_sheet and current_sheet != 'Sheet1':
-            cache_key = f"{session_id}_{current_sheet}"
+        if not filepath.exists():
+            return jsonify({'error': 'File not found'}), 400
+        
+        extension = filepath.suffix.lower()
+        
+        # LIGHTWEIGHT: Load only first 5 rows for preview
+        if extension == '.csv':
+            df_preview = pd.read_csv(filepath, nrows=5, dtype=str, low_memory=False)
         else:
-            cache_key = session_id
+            df_preview = pd.read_excel(filepath, sheet_name=current_sheet, nrows=5, dtype=str)
         
-        print(f"DEBUG: Looking for cache key: {cache_key}, current_sheet: {current_sheet}")
-        print(f"DEBUG: Available cache keys: {list(dataframe_cache.keys())}")
-        
-        # Use the cached DataFrame for the currently loaded sheet
-        if cache_key not in dataframe_cache:
-            return jsonify({'error': 'Data not available. Please re-upload or select a sheet.'}), 400
-        
-        df = dataframe_cache[cache_key]
+        # Clean column names
+        df_preview.columns = [c.strip() if isinstance(c, str) else c for c in df_preview.columns]
         
         # Convert column letters to indices
         answer_idx = column_letter_to_index(answer_col)
@@ -316,29 +435,28 @@ def preview_data():
         topic_end_idx = column_letter_to_index(topic_end)
         
         # Validate indices
-        if answer_idx >= len(df.columns) or topic_start_idx >= len(df.columns) or topic_end_idx >= len(df.columns):
+        if answer_idx >= len(df_preview.columns) or topic_start_idx >= len(df_preview.columns) or topic_end_idx >= len(df_preview.columns):
             return jsonify({'error': 'Invalid column selection'}), 400
         
         if topic_end_idx < topic_start_idx:
             return jsonify({'error': 'End column must be after or equal to start column'}), 400
         
         # Get column names
-        answer_column_name = df.columns[answer_idx]
-        topic_columns = df.columns[topic_start_idx:topic_end_idx + 1].tolist()
+        answer_column_name = df_preview.columns[answer_idx]
+        topic_columns = df_preview.columns[topic_start_idx:topic_end_idx + 1].tolist()
         
         # Get preview data (first 5 rows)
         preview_data = []
-        for i in range(min(5, len(df))):
+        for i in range(len(df_preview)):
+            answer_text = str(df_preview.iloc[i, answer_idx])
             row_data = {
                 'row_num': i + 1,
-                'answer': str(df.iloc[i, answer_idx])[:100] + '...' if len(str(df.iloc[i, answer_idx])) > 100 else str(df.iloc[i, answer_idx])
+                'answer': answer_text[:100] + '...' if len(answer_text) > 100 else answer_text
             }
             preview_data.append(row_data)
         
         # Format topic columns as numbered list
-        topic_columns_formatted = []
-        for idx, topic in enumerate(topic_columns, 1):
-            topic_columns_formatted.append(f"{idx}) {topic}")
+        topic_columns_formatted = [f"{idx}) {topic}" for idx, topic in enumerate(topic_columns, 1)]
         
         return jsonify({
             'success': True,
@@ -355,7 +473,12 @@ def preview_data():
 
 @app.route('/classify', methods=['POST'])
 def classify():
-    """Start classification process."""
+    """
+    Start classification process.
+    
+    This is where the FULL DATA LOADING happens - uses efficient 
+    bottom-up trimming to load only non-empty rows.
+    """
     try:
         data = request.json
         sheet_name = data.get('sheet_name')
@@ -367,34 +490,20 @@ def classify():
             return jsonify({'error': 'No file uploaded'}), 400
         
         session_id = session.get('session_id')
+        filepath = Path(session['uploaded_file'])
+        current_sheet = session.get('current_sheet')
         
         # Initialize progress queue for this session
         progress_queues[session_id] = Queue()
-        
-        # Use cached DataFrame if available, otherwise read the file
-        if session_id in dataframe_cache:
-            df = dataframe_cache[session_id].copy()  # Use copy to avoid modifying cached version
-        else:
-            filepath = Path(session['uploaded_file'])
-            df, _, _ = read_file(filepath, sheet_name)
-        
-        # Strip whitespace from column names
-        df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+        queue = progress_queues[session_id]
         
         # Convert column letters to indices
         answer_idx = column_letter_to_index(answer_col)
         topic_start_idx = column_letter_to_index(topic_start)
         topic_end_idx = column_letter_to_index(topic_end)
         
-        # Get column names
-        main_column = df.columns[answer_idx]
-        topic_cols = df.columns[topic_start_idx:topic_end_idx + 1].tolist()
-        
         # Load configuration
         config = OpenAIConfig.from_env()
-        
-        # Get queue and output filename before thread starts
-        queue = progress_queues[session_id]
         original_filename = session['original_filename']
         
         # Run classification in a separate thread
@@ -407,8 +516,21 @@ def classify():
             sys.stderr = progress_capture  # Also capture stderr for progress messages
             
             try:
-                queue.put(f"Starting classification...")
+                queue.put("Starting classification...")
                 queue.put(f"Model: {config.model}")
+                
+                # EFFICIENT LOADING: Uses bottom-up scan to find last non-empty row,
+                # then loads only the rows we need (not all 1M+ empty rows)
+                df = load_and_trim_for_classification(
+                    filepath, 
+                    current_sheet,
+                    progress_callback=lambda msg: queue.put(msg)
+                )
+                
+                # Get column names
+                main_column = df.columns[answer_idx]
+                topic_cols = df.columns[topic_start_idx:topic_end_idx + 1].tolist()
+                
                 queue.put(f"Processing {len(df)} rows with {len(topic_cols)} topics")
                 
                 # Run classification
@@ -440,9 +562,6 @@ def classify():
             finally:
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
-                # Clean up cached DataFrame after processing
-                if session_id in dataframe_cache:
-                    del dataframe_cache[session_id]
         
         # Start classification thread
         thread = threading.Thread(target=run_classification)
