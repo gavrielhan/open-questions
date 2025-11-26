@@ -128,10 +128,36 @@
             background: #e8f5e9;
             border-radius: 10px;
             display: none;
+            text-align: left;
+            position: relative;
+            pointer-events: auto;
         }
 
         .file-info.visible {
             display: block;
+        }
+
+        .file-info-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .clear-upload-btn {
+            background: transparent;
+            border: none;
+            color: #d32f2f;
+            font-size: 20px;
+            line-height: 1;
+            cursor: pointer;
+            padding: 0;
+            transition: color 0.2s ease, transform 0.2s ease;
+        }
+
+        .clear-upload-btn:hover {
+            color: #b71c1c;
+            transform: scale(1.1);
         }
 
         /* Form controls */
@@ -417,7 +443,10 @@
                 <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
             </div>
             <div class="file-info" id="fileInfo">
-                <strong id="fileName"></strong><br>
+                <div class="file-info-header">
+                    <strong id="fileName"></strong>
+                    <button type="button" class="clear-upload-btn" id="clearUploadButton" aria-label="Remove uploaded file">✕</button>
+                </div>
                 <span id="fileStats"></span>
             </div>
             
@@ -500,12 +529,14 @@
         let sessionId = null;
         let sheets = [];
         let columns = [];
+        let currentLoadedSheet = null;  // Track which sheet is currently loaded
 
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
         const fileInfo = document.getElementById('fileInfo');
         const fileName = document.getElementById('fileName');
         const fileStats = document.getElementById('fileStats');
+        const clearUploadButton = document.getElementById('clearUploadButton');
         const sheetSelect = document.getElementById('sheetSelect');
         const answerColumn = document.getElementById('answerColumn');
         const topicStartColumn = document.getElementById('topicStartColumn');
@@ -533,6 +564,64 @@
             step.classList.add('completed');
         }
 
+        if (clearUploadButton) {
+            clearUploadButton.addEventListener('click', async (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                await resetUploadState();
+            });
+        }
+
+        async function resetUploadState(showMessage = true) {
+            try {
+                await fetch('/reset_upload', { method: 'POST' });
+            } catch (error) {
+                console.warn('Failed to reset upload on server:', error);
+            }
+
+            uploadedFile = null;
+            sessionId = null;
+            sheets = [];
+            columns = [];
+            currentLoadedSheet = null;
+
+            fileInput.value = '';
+            fileInfo.classList.remove('visible');
+            fileName.textContent = '';
+            fileStats.textContent = '';
+
+            sheetSelect.innerHTML = '<option value="">-- Select a sheet --</option>';
+            sheetSelect.value = '';
+            sheetSpinner.classList.remove('visible');
+            sheetStatus.classList.remove('visible');
+
+            answerColumn.value = '';
+            topicStartColumn.value = '';
+            topicEndColumn.value = '';
+
+            previewBox.style.display = 'none';
+            previewContent.innerHTML = '';
+            previewInfo.innerHTML = '';
+
+            progressConsole.classList.remove('visible');
+            progressConsole.innerHTML = '';
+
+            spinner.classList.remove('visible');
+            status.classList.remove('visible');
+            status.textContent = '';
+
+            document.querySelectorAll('.step').forEach((step, index) => {
+                step.classList.remove('completed', 'active');
+                if (index === 0) {
+                    step.classList.add('active');
+                }
+            });
+
+            if (showMessage) {
+                showStatus('info', 'ℹ️ Upload cleared. Please choose a new file.');
+            }
+        }
+
         // File upload handling
         uploadArea.addEventListener('click', () => fileInput.click());
 
@@ -555,6 +644,10 @@
 
         async function handleFile(file) {
             if (!file) return;
+
+            if (uploadedFile) {
+                await resetUploadState(false);
+            }
 
             const formData = new FormData();
             formData.append('file', file);
@@ -633,8 +726,6 @@
         }
 
         // Sheet selection
-        let currentLoadedSheet = null;  // Track which sheet is currently loaded
-        
         sheetSelect.addEventListener('change', handleSheetSelection);
 
         async function handleSheetSelection() {

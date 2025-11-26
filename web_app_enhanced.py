@@ -372,6 +372,29 @@ def upload_file():
         return jsonify({'error': f'Error processing file: {str(e)}'}), 500
 
 
+@app.route('/reset_upload', methods=['POST'])
+def reset_upload():
+    """Delete the currently uploaded file and clear session metadata so a new file can be selected."""
+    try:
+        session_id = session.get('session_id')
+        filepath_str = session.get('uploaded_file')
+        
+        if filepath_str:
+            filepath = Path(filepath_str)
+            if filepath.exists():
+                filepath.unlink()
+        
+        if session_id and session_id in progress_queues:
+            progress_queues.pop(session_id, None)
+        
+        for key in ('uploaded_file', 'original_filename', 'sheet_names', 'current_sheet', 'session_id'):
+            session.pop(key, None)
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/load_sheet', methods=['POST'])
 def load_sheet():
     """
