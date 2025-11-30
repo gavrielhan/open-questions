@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 import requests
@@ -29,7 +29,7 @@ class OpenAIConfig:
     temperature: float = 0.0
     max_retries: int = 5
     retry_backoff_seconds: float = 2.0
-    batch_size: int = 3           # smaller = fewer 429s and shorter responses (reduced from 5 for 9 topics)
+    batch_size: int = 5           # number of texts to process per batch
     parallel_workers: int = 2     # lower concurrency for LiteLLM
     request_delay_seconds: float = 0.5  # delay between API requests to avoid rate limits
     # DeepSeek config for YAML repair (Azure endpoint)
@@ -38,7 +38,7 @@ class OpenAIConfig:
     repair_endpoint: str = "https://sni-ai-foundry.services.ai.azure.com/openai/v1/"
     repair_api_version: str = "2025-04-01-preview"
     # Azure AI Foundry config
-    api_version: str = "2024-12-01-preview"  # Azure API version
+    api_version: str = "2025-04-01-preview"  # Azure API version (latest for GPT-5.1)
     
     def is_azure(self) -> bool:
         """Check if this is an Azure AI Foundry endpoint."""
@@ -75,7 +75,7 @@ class OpenAIConfig:
         repair_model = os.getenv("REPAIR_MODEL", "DeepSeek-V3.1-gavriel")
         repair_endpoint = os.getenv("REPAIR_ENDPOINT", "https://sni-ai-foundry.services.ai.azure.com/openai/v1/")
         repair_api_version = os.getenv("REPAIR_API_VERSION", "2025-04-01-preview")
-        api_version = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
+        api_version = os.getenv("AZURE_API_VERSION", "2025-04-01-preview")
 
         return cls(
             api_key=api_key,
@@ -112,30 +112,39 @@ def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIC
     # Build the prompt
     topics_text = inputs["topics"]
     texts = inputs["texts"]
-    
-    sample_topics_block = "\n".join(f"    {topics[i]}: 0" for i in range(min(3, len(topics))))
-    if len(topics) > 3:
-        sample_topics_block += "\n    ..."
+    question = inputs.get("question", "")
     
     system_prompt = (
-        "You are an expert annotator for academic media research analyzing Hebrew text. "
-        "For each numbered main text below (written in Hebrew), decide whether every topic is explicitly mentioned or clearly discussed.\n\n"
-        "Guidelines:\n"
-        "- The main texts are in Hebrew. The topic names are also in Hebrew.\n"
-        "- If a text is empty or very short and with no real information, return 0 for all topics.\n"
-        "- Respond with YAML only; no markdown fences or commentary.\n"
-        "- Use integers 0 or 1 only. 1 means the topic is clearly mentioned, 0 otherwise.\n"
-        "- If uncertain, choose 0.\n"
-        "- Include every topic exactly once per row and use the topic names exactly as provided.\n"
-        "- Ensure the YAML is strictly valid and properly indented."
+        "Act like an expert annotator for academic media research specializing in Hebrew-language content analysis.\n\n"
+        "Your goal is to assign, for each Hebrew main text and each Hebrew topic, a binary label indicating whether the topic is clearly present in the text, and to output only a clean YAML structure.\n\n"
+        "Inputs:\n\n"
+        "- A question context that provides background for the texts.\n\n"
+        "- A list of numbered main texts in Hebrew.\n\n"
+        "- A list of topic names in Hebrew.\n\n"
+        "Task:\n\n"
+        "For every (text, topic) pair, output 1 if the topic is clearly and explicitly mentioned or discussed in the text; otherwise output 0.\n\n"
+        "Step-by-step:\n\n"
+        "1) Read and remember the full list of Hebrew topics, preserving each topic string exactly.\n\n"
+        "2) For each numbered text:\n\n"
+        "   a) If the text is empty, almost empty, or lacks substantive information, set all topics to 0.\n\n"
+        "   b) For each topic, check if the topic or an unambiguous paraphrase is clearly present or directly discussed.\n\n"
+        "   c) If the signal is vague, implicit, or requires outside knowledge, set 0.\n\n"
+        "   d) Set 1 only when the topic is clearly indicated in the text itself.\n\n"
+        "3) Do not infer topics beyond what is directly signaled by the text.\n\n"
+        "Output format (YAML only):\n\n"
+        "- A YAML list, where each element is a mapping for one text:\n\n"
+        "  - id: the text number as an integer.\n\n"
+        "  - One key per topic (exact topic strings), each with value 0 or 1.\n\n"
+        "Constraints:\n\n"
+        "- Output strictly valid YAML, properly indented.\n\n"
+        "- No markdown fences, no comments, no explanations, no extra keys.\n\n"
+        "- Use only integers 0 or 1.\n\n"
+        "- Include every topic exactly once per text.\n\n"
+        "Take a deep breath and work on this problem step-by-step."
     )
     
     user_prompt = (
-        f"Return strictly valid YAML with the structure:\n"
-        f"1:\n"
-        f"{sample_topics_block}\n"
-        f"2:\n"
-        f"    ...\n\n"
+        f"Question context: {question}\n\n"
         f"Topics: {topics_text}\n\n"
         f"Main texts (Hebrew):\n"
         f"{texts}"
@@ -284,6 +293,9 @@ def _strip_code_fences(content: str) -> str:
 def _parse_yaml_content(content: str) -> Dict[str, Any]:
     """
     Parse YAML (or JSON-as-YAML) content into a Python dict with string keys.
+    Handles two formats:
+    1. Old format: { "1": {topic: value}, "2": {topic: value} }
+    2. New format: [ {id: 1, topic: value}, {id: 2, topic: value} ]
     """
     cleaned = _strip_code_fences(content)
     if not cleaned:
@@ -294,8 +306,35 @@ def _parse_yaml_content(content: str) -> Dict[str, Any]:
     except yaml.YAMLError as exc:
         raise ValueError(f"YAML parse error: {exc}") from exc
 
+    # Handle new format: list with id keys
+    if isinstance(data, list):
+        normalized = {}
+        for item in data:
+            if not isinstance(item, Mapping):
+                continue
+            # Extract id (could be 'id' key or numeric key)
+            text_id = None
+            if 'id' in item:
+                text_id = str(item['id'])
+            elif isinstance(item, dict) and len(item) > 0:
+                # Fallback: try to find numeric key or use first key
+                for key in item.keys():
+                    if key != 'id' and str(key).isdigit():
+                        text_id = str(key)
+                        break
+                if text_id is None:
+                    # No id found, skip this item
+                    continue
+            
+            if text_id:
+                # Create dict without 'id' key
+                text_data = {k: v for k, v in item.items() if k != 'id'}
+                normalized[text_id] = text_data
+        return normalized
+    
+    # Handle old format: mapping with numeric/string keys
     if not isinstance(data, Mapping):
-        raise ValueError("YAML root element must be a mapping/object.")
+        raise ValueError("YAML root element must be a mapping/object or list.")
 
     # Convert top-level keys to strings (YAML may load numbers as ints)
     normalized = {}
@@ -312,30 +351,39 @@ def _classify_with_deepseek(inputs: dict, topics: Sequence[str], config: OpenAIC
     # Build the prompt (same as GPT-5.1)
     topics_text = inputs["topics"]
     texts = inputs["texts"]
-    
-    sample_topics_block = "\n".join(f"    {topics[i]}: 0" for i in range(min(3, len(topics))))
-    if len(topics) > 3:
-        sample_topics_block += "\n    ..."
+    question = inputs.get("question", "")
     
     system_prompt = (
-        "You are an expert annotator for academic media research analyzing Hebrew text. "
-        "For each numbered main text below (written in Hebrew), decide whether every topic is explicitly mentioned or clearly discussed.\n\n"
-        "Guidelines:\n"
-        "- The main texts are in Hebrew. The topic names are also in Hebrew.\n"
-        "- If a text is empty or very short and with no real information, return 0 for all topics.\n"
-        "- Respond with YAML only; no markdown fences or commentary.\n"
-        "- Use integers 0 or 1 only. 1 means the topic is clearly mentioned, 0 otherwise.\n"
-        "- If uncertain, choose 0.\n"
-        "- Include every topic exactly once per row and use the topic names exactly as provided.\n"
-        "- Ensure the YAML is strictly valid and properly indented. Do not only look for keywords!"
+        "Act like an expert annotator for academic media research specializing in Hebrew-language content analysis.\n\n"
+        "Your goal is to assign, for each Hebrew main text and each Hebrew topic, a binary label indicating whether the topic is clearly present in the text, and to output only a clean YAML structure.\n\n"
+        "Inputs:\n\n"
+        "- A question context that provides background for the texts.\n\n"
+        "- A list of numbered main texts in Hebrew.\n\n"
+        "- A list of topic names in Hebrew.\n\n"
+        "Task:\n\n"
+        "For every (text, topic) pair, output 1 if the topic is clearly and explicitly mentioned or discussed in the text; otherwise output 0.\n\n"
+        "Step-by-step:\n\n"
+        "1) Read and remember the full list of Hebrew topics, preserving each topic string exactly.\n\n"
+        "2) For each numbered text:\n\n"
+        "   a) If the text is empty, almost empty, or lacks substantive information, set all topics to 0.\n\n"
+        "   b) For each topic, check if the topic or an unambiguous paraphrase is clearly present or directly discussed.\n\n"
+        "   c) If the signal is vague, implicit, or requires outside knowledge, set 0.\n\n"
+        "   d) Set 1 only when the topic is clearly indicated in the text itself.\n\n"
+        "3) Do not infer topics beyond what is directly signaled by the text.\n\n"
+        "Output format (YAML only):\n\n"
+        "- A YAML list, where each element is a mapping for one text:\n\n"
+        "  - id: the text number as an integer.\n\n"
+        "  - One key per topic (exact topic strings), each with value 0 or 1.\n\n"
+        "Constraints:\n\n"
+        "- Output strictly valid YAML, properly indented.\n\n"
+        "- No markdown fences, no comments, no explanations, no extra keys.\n\n"
+        "- Use only integers 0 or 1.\n\n"
+        "- Include every topic exactly once per text.\n\n"
+        "Take a deep breath and work on this problem step-by-step."
     )
     
     user_prompt = (
-        f"Return strictly valid YAML with the structure:\n"
-        f"1:\n"
-        f"{sample_topics_block}\n"
-        f"2:\n"
-        f"    ...\n\n"
+        f"Question context: {question}\n\n"
         f"Topics: {topics_text}\n\n"
         f"Main texts (Hebrew):\n"
         f"{texts}"
@@ -417,26 +465,32 @@ def _resolve_conflict_with_judge(
     Returns: The resolved value (0 or 1)
     """
     system_prompt = (
-        "You are an expert linguist and logical analyst specializing in Hebrew text analysis. "
-        "Two independent AI classifiers have analyzed the same text and reached different conclusions "
-        "about whether a specific topic is present. Your task is to carefully analyze the text and "
-        "make the final determination.\n\n"
-        "You must respond with ONLY a single digit: 0 or 1.\n"
-        "- 1 = The topic IS clearly mentioned or discussed in the text\n"
-        "- 0 = The topic is NOT clearly mentioned or discussed in the text\n\n"
-        "Be rigorous: only return 1 if the topic is explicitly present, not merely implied, and do not only look for keywords!"
+        "Act like an expert linguist and logical analyst specializing in Hebrew text analysis.\n\n"
+        "Your goal is to resolve a disagreement between two independent AI classifiers about whether a given Hebrew text clearly mentions or discusses a specific topic, and to output a single definitive binary decision (0 or 1).\n\n"
+        "Task:\n\n"
+        "1) Carefully read the full Hebrew text and understand its meaning in context.\n\n"
+        "2) Interpret the topic phrase precisely in Hebrew, including natural paraphrases and close formulations.\n\n"
+        "3) Independently decide if the topic is clearly and explicitly mentioned or discussed:\n\n"
+        "   - Output 1 only if the topic is clearly present, explicitly referenced, or directly discussed in the text.\n\n"
+        "   - Output 0 if the topic is absent, only implied, vague, tangential, or requires external/world knowledge to connect.\n\n"
+        "4) Use the classifier decisions only as background signals; do not average them or follow them blindly. Your judgment is final.\n\n"
+        "Constraints:\n\n"
+        "- Respond with ONLY a single character: 0 or 1.\n\n"
+        "- No spaces, no newlines before or after, no explanations, no punctuation, no extra text.\n\n"
+        "- Think rigorously about the relationship between the topic and the text before deciding."
     )
     
     user_prompt = (
-        f"Two expert classifiers have analyzed the following Hebrew text and disagree about whether "
-        f"a specific topic is present.\n\n"
-        f"**Question context:** {question}\n\n"
-        f"**Text to analyze (Hebrew):**\n{text}\n\n"
-        f"**Topic in question:** {topic}\n\n"
-        f"**Classifier A says:** {gpt_value} ({'topic IS present' if gpt_value == 1 else 'topic is NOT present'})\n"
-        f"**Classifier B says:** {deepseek_value} ({'topic IS present' if deepseek_value == 1 else 'topic is NOT present'})\n\n"
-        f"After careful analysis of the text, is the topic '{topic}' clearly mentioned or discussed? Do not only look for keywords!\n\n"
-        f"Respond with ONLY: 0 or 1"
+        f"Question context: {question}\n\n"
+        f"Hebrew text to analyze:\n\n"
+        f"{text}\n\n"
+        f"Topic in question (Hebrew):\n\n"
+        f"{topic}\n\n"
+        f"Classifier A decision: {gpt_value} (1 = topic IS present, 0 = topic is NOT present)\n"
+        f"Classifier B decision: {deepseek_value} (1 = topic IS present, 0 = topic is NOT present)\n\n"
+        f"After carefully analyzing the Hebrew text and applying the system instructions, decide whether the topic is clearly mentioned or directly discussed in the text. Do not rely on keywords alone or on the classifier outputs; base your answer on the actual content of the text.\n\n"
+        f"Respond with ONLY: 0 or 1\n\n"
+        f"Take a deep breath and work on this problem step-by-step."
     )
     
     url = config.get_chat_completions_url()
@@ -517,15 +571,15 @@ def _compare_and_resolve_classifications(
     question: str,
     topics: Sequence[str],
     config: OpenAIConfig,
-) -> Tuple[List[Dict[str, int]], List[Dict]]:
+) -> Tuple[List[Dict[str, Union[int, str]]], List[Dict]]:
     """
     Compare GPT-5.1 and DeepSeek classifications, resolve conflicts using GPT-5.1 as judge.
     
     Returns:
-        - final_classifications: List of resolved classifications
+        - final_classifications: List of resolved classifications (values are int for agreement, str like "1*" or "0*" for judge-resolved)
         - conflict_report: List of conflicts that were resolved (for reporting)
     """
-    final_classifications: List[Dict[str, int]] = []
+    final_classifications: List[Dict[str, Union[int, str]]] = []
     conflict_report: List[Dict] = []
     
     for i in range(1, len(texts) + 1):
@@ -540,7 +594,7 @@ def _compare_and_resolve_classifications(
         gpt_class = gpt_raw if isinstance(gpt_raw, dict) else {}
         deepseek_class = deepseek_raw if isinstance(deepseek_raw, dict) else {}
         
-        final_class: Dict[str, int] = {}
+        final_class: Dict[str, Union[int, str]] = {}
         text_conflicts: List[Dict] = []
         
         for topic in topics:
@@ -566,7 +620,8 @@ def _compare_and_resolve_classifications(
                     config=config,
                 )
                 
-                final_class[topic] = resolved
+                # Mark judge-resolved decisions with "*"
+                final_class[topic] = f"{resolved}*"
                 text_conflicts.append({
                     "text_index": i,
                     "topic": topic,
@@ -629,220 +684,6 @@ def _trim_trailing_empty_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
 
     rows_removed = original_rows - len(trimmed_df)
     return trimmed_df, rows_removed
-
-
-def _validate_with_direct_api(
-    question: str,
-    text: str,
-    initial_classifications: dict,
-    topics: Sequence[str],
-    config: OpenAIConfig,
-    error_log: Optional[List[str]] = None,
-    text_index: Optional[int] = None,
-) -> dict:
-    """
-    Validate classifications using direct API calls.
-    Uses GPT-5.1 to double-check the initial classifications.
-    Returns: dict of {topic: 0 or 1}
-    """
-    # Build URL based on provider
-    if config.is_azure():
-        url = config.get_chat_completions_url()
-    else:
-        url = f"{config.api_base_url.rstrip('/')}/v1/chat/completions"
-    
-    classifications_str = ", ".join(f'"{topic}": {value}' for topic, value in initial_classifications.items())
-    topics_text = ", ".join(topics)
-    
-    system_prompt = (
-        "You are a quality control expert reviewing topic classifications for Hebrew text analysis. "
-        "Your job is to verify and correct the initial classifications.\n\n"
-        "Guidelines:\n"
-        "- The question and text are in Hebrew. The topic names are also in Hebrew.\n"
-        "- Return 1 only if the topic is clearly discussed in the text.\n"
-        "- Return 0 if uncertain or if the topic is not clearly present.\n"
-        "- Respond with valid YAML only (no prose, no JSON, no code fences)."
-    )
-    
-    user_prompt = (
-        f"Review and correct these classifications if needed.\n\n"
-        f"Question: {question}\n"
-        f"Text: {text}\n\n"
-        f"Initial Classifications: {{{classifications_str}}}\n\n"
-        f"Topics: {topics_text}\n\n"
-        f"Return corrected classifications as YAML with all topics:\n"
-        f"{topics[0]}: 0 or 1\n"
-        f"..."
-    )
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {config.api_key}"
-    }
-    
-    payload = {
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-    }
-    
-    # Set max_tokens based on provider
-    if config.is_azure():
-        payload["max_completion_tokens"] = 2000
-    else:
-        payload["max_tokens"] = 2000
-        payload["model"] = config.model
-        payload["temperature"] = 0
-    
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        
-        # Extract and parse YAML
-        try:
-            result = _parse_yaml_content(content)
-        except ValueError as yaml_error:
-            # Try repair with detailed context
-            error_msg = str(yaml_error)
-            print(f"⚠️  Validation YAML error: {error_msg}", file=sys.stderr)
-            if error_log is not None:
-                entry_prefix = f"Text #{text_index + 1}: " if text_index is not None else ""
-                error_log.append(f"{entry_prefix}{error_msg}")
-            repaired = _repair_yaml_auto(
-                content,
-                topics,
-                config,
-                error_message=error_msg,
-                error_log=error_log,
-            )
-            if repaired:
-                result = repaired
-                print(f"✅ YAML repaired successfully", file=sys.stderr)
-            else:
-                print(f"❌ Repair failed, using initial classifications", file=sys.stderr)
-                return initial_classifications
-        
-        # Ensure all topics are present - handle case where result is not a dict
-        validated = {}
-        result_dict = result if isinstance(result, dict) else {}
-        for topic in topics:
-            value = result_dict.get(topic, initial_classifications.get(topic, 0))
-            validated[topic] = int(value in (1, "1", True))
-        
-        return validated
-        
-    except Exception as exc:
-        print(f"⚠️  Validation failed: {exc}, using initial classifications", file=sys.stderr)
-        return initial_classifications
-
-
-def _reevaluate_with_deepseek(
-    question: str,
-    text: str,
-    topic: str,
-    initial_value: int,
-    confidence: float,
-    config: OpenAIConfig,
-    error_log: Optional[List[str]] = None,
-) -> Tuple[int, bool]:
-    """
-    Re-evaluate a single topic classification using DeepSeek when confidence is low.
-    Uses direct API calls instead of LangChain.
-    
-    Returns: (value, success_flag)
-        - value: 0 or 1
-        - success_flag: True if DeepSeek succeeded, False if we fell back to initial value
-    """
-    if not config.repair_api_key:
-        print(f"No repair API key, keeping initial value for {topic}", file=sys.stderr)
-        return initial_value, False
-    
-    if error_log is None:
-        error_log = []
-    
-    url = f"{config.repair_endpoint.rstrip('/')}/chat/completions"
-    print(f"  🔄 Re-evaluating '{topic}' with DeepSeek at: {url}", file=sys.stderr)
-    
-    system_prompt = (
-        "You are a senior expert annotator reviewing classifications that had low confidence scores. "
-        "Re-analyze the given question, text, and topic to make a more confident decision.\n\n"
-        "Guidelines:\n"
-        "- The question and text are in Hebrew. The topic name is also in Hebrew.\n"
-        "- Return 1 if the topic is clearly discussed or mentioned in the text.\n"
-        "- Return 0 if the topic is not mentioned or only tangentially related.\n"
-        "- If uncertain, choose 0.\n"
-        "- Respond with valid YAML only (no prose, no JSON)."
-    )
-    
-    user_prompt = (
-        f"Re-evaluate this low-confidence classification with extra scrutiny.\n\n"
-        f"Question: {question}\n"
-        f"Text: {text}\n\n"
-        f"Topic: {topic}\n"
-        f"Initial Classification: {initial_value}\n"
-        f"Confidence: {confidence:.2f}\n\n"
-        f"Return the corrected classification as YAML:\n"
-        f"{topic}: 0 or 1"
-    )
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {config.repair_api_key}"
-    }
-    
-    payload = {
-        "model": config.repair_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "max_tokens": 100,
-        "temperature": 0.7,
-    }
-    
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        
-        # Extract and parse YAML
-        try:
-            result = _parse_yaml_content(content)
-        except ValueError as yaml_error:
-            # YAML parsing failed - try repair
-            error_msg = str(yaml_error)
-            print(f"⚠️  Re-evaluation YAML error for '{topic}': {error_msg}", file=sys.stderr)
-            error_log.append(f"Re-evaluation YAML error for '{topic}': {error_msg}")
-            
-            # Try the full repair pipeline (GPT-5.1 self-repair + 5 DeepSeek attempts)
-            repaired = _repair_yaml_auto(
-                content,
-                [topic],  # Only this topic
-                config,
-                error_message=error_msg,
-                error_log=error_log,
-            )
-            
-            if repaired is None:
-                # All repair attempts failed - use initial low-confidence value
-                print(f"⚠️  All repair attempts failed for '{topic}', using initial low-confidence value: {initial_value}", file=sys.stderr)
-                return initial_value, False
-            
-            result = repaired
-        
-        # Get the value for this topic - handle case where result is not a dict
-        result_dict = result if isinstance(result, dict) else {}
-        value = result_dict.get(topic, initial_value)
-        return int(value in (1, "1", True)), True
-        
-    except Exception as exc:
-        error_log.append(f"DeepSeek re-evaluation failed for '{topic}': {exc}")
-        print(f"❌ DeepSeek re-evaluation failed for {topic}: {exc}, using initial value", file=sys.stderr)
-        return initial_value, False
 
 
 def _repair_yaml_with_deepseek(
@@ -915,7 +756,11 @@ def _repair_yaml_with_deepseek(
         content = data["choices"][0]["message"]["content"]
         return _parse_yaml_content(content)
     except Exception as exc:
-        print(f"DeepSeek YAML repair failed: {exc}", file=sys.stderr)
+        error_msg = str(exc)
+        print(f"DeepSeek YAML repair failed: {error_msg}", file=sys.stderr)
+        # Add error to log for next attempt
+        if error_log is not None:
+            error_log.append(f"DeepSeek repair error: {error_msg}")
         return None
 
 
@@ -978,7 +823,11 @@ def _repair_yaml_with_gpt(
         content = data["choices"][0]["message"]["content"]
         return _parse_yaml_content(content)
     except Exception as exc:
-        print(f"GPT YAML repair failed: {exc}", file=sys.stderr)
+        error_msg = str(exc)
+        print(f"GPT YAML repair failed: {error_msg}", file=sys.stderr)
+        # Add error to log for next attempt
+        if error_log is not None:
+            error_log.append(f"GPT repair error: {error_msg}")
         return None
 
 
@@ -992,7 +841,9 @@ def _repair_yaml_auto(
     """
     Two-stage YAML repair process:
     1. GPT-5.1 self-repair (1 attempt) - same model that generated it
-    2. DeepSeek repair (5 attempts with accumulated error log) - external repair model
+    2. Alternating DeepSeek and GPT repair (5 attempts total: 3 DeepSeek, 2 GPT)
+       - Starts with DeepSeek, then alternates
+       - Always includes error messages as context
     
     Returns: Repaired dict or None if all attempts fail
     """
@@ -1008,23 +859,32 @@ def _repair_yaml_auto(
         print("✅ YAML repaired successfully with GPT-5.1 self-repair", file=sys.stderr)
         return repaired
     
-    # Stage 2: DeepSeek repair (5 attempts with error log)
-    print("⚠️  GPT-5.1 self-repair failed. Stage 2: Attempting DeepSeek repair (up to 5 attempts)...", file=sys.stderr)
+    # Stage 2: Alternating DeepSeek and GPT repair (5 attempts: 3 DeepSeek, 2 GPT)
+    print("⚠️  GPT-5.1 self-repair failed. Stage 2: Attempting alternating repair (DeepSeek → GPT → DeepSeek → GPT → DeepSeek)...", file=sys.stderr)
     
-    for attempt in range(1, 6):  # 5 attempts
-        error_log.append(f"DeepSeek repair attempt {attempt}/5")
-        repaired = _repair_yaml_with_deepseek(
+    # Pattern: DeepSeek, GPT, DeepSeek, GPT, DeepSeek (3 DeepSeek, 2 GPT)
+    repair_sequence = [
+        ("DeepSeek", _repair_yaml_with_deepseek),
+        ("GPT", _repair_yaml_with_gpt),
+        ("DeepSeek", _repair_yaml_with_deepseek),
+        ("GPT", _repair_yaml_with_gpt),
+        ("DeepSeek", _repair_yaml_with_deepseek),
+    ]
+    
+    for attempt, (model_name, repair_func) in enumerate(repair_sequence, start=1):
+        error_log.append(f"{model_name} repair attempt {attempt}/5")
+        repaired = repair_func(
             broken_yaml, topic_columns, config, error_message=error_message, error_log=error_log
         )
         if repaired is not None:
-            print(f"✅ YAML repaired successfully with DeepSeek (attempt {attempt}/5)", file=sys.stderr)
+            print(f"✅ YAML repaired successfully with {model_name} (attempt {attempt}/5)", file=sys.stderr)
             return repaired
         else:
-            print(f"❌ DeepSeek repair attempt {attempt}/5 failed", file=sys.stderr)
+            print(f"❌ {model_name} repair attempt {attempt}/5 failed", file=sys.stderr)
             if attempt < 5:
                 time.sleep(1 * attempt)  # Brief delay between attempts
     
-    print("❌ All repair attempts failed (1 GPT-5.1 + 5 DeepSeek)", file=sys.stderr)
+    print("❌ All repair attempts failed (1 GPT-5.1 self-repair + 5 alternating repairs)", file=sys.stderr)
     return None
 
 
@@ -1032,7 +892,7 @@ def _repair_yaml_auto(
 # CLASSIFICATION
 # ================================================================
 
-def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, config: OpenAIConfig) -> List[Dict[str, int]]:
+def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, config: OpenAIConfig) -> List[Dict[str, Union[int, str]]]:
     """
     Classify a batch of texts using PARALLEL DUAL-MODEL approach.
     
@@ -1046,12 +906,13 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
     - Agreement = high confidence (both models agree)
     - Disagreement = low confidence → resolve with judge
     
-    Returns: List of {topic: 0/1} dicts in the same order as input texts.
+    Returns: List of {topic: 0/1 or "0*"/"1*"} dicts in the same order as input texts.
+            Values with "*" indicate judge-resolved conflicts.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
     # Filter out short texts - return all 0s for them
-    results: List[Optional[Dict[str, int]]] = []
+    results: List[Optional[Dict[str, Union[int, str]]]] = []
     texts_to_process: List[Tuple[int, str]] = []
     
     for idx, text in enumerate(texts):
@@ -1222,18 +1083,59 @@ def update_topics(
         print("No rows require classification (either empty or already filled).")
         return df
 
-    batches = [
-        rows_to_process[i : i + config.batch_size]
-        for i in range(0, len(rows_to_process), config.batch_size)
-    ]
-
+    # Create length-balanced batches
+    # Calculate number of batches needed (at least 1, at most len(rows_to_process))
+    num_batches = max(1, (len(rows_to_process) + config.batch_size - 1) // config.batch_size)
+    
+    # Calculate text lengths and create (length, row_data) tuples
+    rows_with_lengths = [(len(text), (idx, text)) for idx, text in rows_to_process]
+    
+    # Sort by length descending (largest first) for better bin-packing
+    rows_with_lengths.sort(reverse=True)
+    
+    # Initialize batches: each batch is a list of (idx, text) tuples and tracks total length
+    batches: List[Tuple[int, List[Tuple[Any, str]]]] = []
+    for _ in range(num_batches):
+        batches.append((0, []))  # (total_length, list of rows)
+    
+    # Greedy bin-packing: assign each text to the batch with smallest current total length
+    for text_length, (idx, text) in rows_with_lengths:
+        # Find batch with smallest total length that isn't full
+        best_batch_idx = 0
+        best_batch_length = batches[0][0]
+        
+        for i, (batch_length, batch_rows) in enumerate(batches):
+            # Prefer batches that aren't full and have smaller total length
+            if len(batch_rows) < config.batch_size:
+                if len(batches[best_batch_idx][1]) >= config.batch_size or batch_length < best_batch_length:
+                    best_batch_idx = i
+                    best_batch_length = batch_length
+        
+        # Add to best batch
+        current_length, current_rows = batches[best_batch_idx]
+        current_rows.append((idx, text))
+        batches[best_batch_idx] = (current_length + text_length, current_rows)
+    
+    # Extract just the row lists from batches
+    batches = [batch_rows for _, batch_rows in batches if batch_rows]  # Remove empty batches
+    
+    # Calculate statistics for reporting
+    batch_lengths = [sum(len(text) for _, text in batch) for batch in batches]
+    avg_length = sum(batch_lengths) / len(batch_lengths) if batch_lengths else 0
+    min_length = min(batch_lengths) if batch_lengths else 0
+    max_length = max(batch_lengths) if batch_lengths else 0
+    
     print(
-        f"Processing {len(rows_to_process)} rows in {len(batches)} batches "
-        f"(batch_size={config.batch_size}, workers={config.parallel_workers})..."
+        f"Processing {len(rows_to_process)} rows in {len(batches)} length-balanced batches "
+        f"(max_items={config.batch_size}, workers={config.parallel_workers})..."
+    )
+    print(
+        f"  Batch length stats: avg={avg_length:.0f} chars, min={min_length:.0f}, max={max_length:.0f} "
+        f"(spread: {((max_length - min_length) / avg_length * 100) if avg_length > 0 else 0:.1f}%)",
+        file=sys.stderr
     )
 
     failed_batches: List[Tuple[int, List[Any], Exception]] = []
-    low_confidence_batches: List[Tuple[int, List[Any], List[dict]]] = []
 
     with ThreadPoolExecutor(max_workers=config.parallel_workers) as executor:
         futures: Dict[Any, Tuple[int, List[Tuple[Any, str]]]] = {}
@@ -1251,13 +1153,6 @@ def update_topics(
                     for topic, value in topics_result.items():
                         df.at[row_idx, topic] = value
                 print(f"✔ Batch {batch_idx}/{len(batches)} processed by model")
-                
-                # Check if any low-confidence warnings were generated for this batch
-                if hasattr(classify_batch, 'low_confidence_warnings') and classify_batch.low_confidence_warnings:
-                    row_indices = [row_idx for row_idx, _ in batch]
-                    low_confidence_batches.append((batch_idx, row_indices, classify_batch.low_confidence_warnings[:]))
-                    # Clear warnings for next batch
-                    classify_batch.low_confidence_warnings.clear()
                     
             except Exception as exc:
                 row_indices = [row_idx for row_idx, _ in batch]
@@ -1275,21 +1170,6 @@ def update_topics(
             print(
                 f"   • Batch {batch_idx}: Rows {row_indices}\n"
                 f"     Error: {exc}",
-                file=sys.stderr,
-            )
-        print("="*70 + "\n", file=sys.stderr)
-    
-    if low_confidence_batches:
-        print("\n" + "="*70, file=sys.stderr)
-        print("⚠️  SUMMARY OF LOW-CONFIDENCE CLASSIFICATIONS:", file=sys.stderr)
-        print("="*70, file=sys.stderr)
-        print("The following batches had low confidence (<0.6) and DeepSeek re-evaluation", file=sys.stderr)
-        print("encountered YAML repair failures. Initial classifications were used.", file=sys.stderr)
-        print("-"*70, file=sys.stderr)
-        for batch_idx, row_indices, warnings in low_confidence_batches:
-            print(
-                f"   • Batch {batch_idx}: Rows {row_indices}\n"
-                f"     {len(warnings)} text(s) with low-confidence fallback",
                 file=sys.stderr,
             )
         print("="*70 + "\n", file=sys.stderr)
