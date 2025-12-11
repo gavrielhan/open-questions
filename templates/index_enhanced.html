@@ -61,6 +61,7 @@
 
         .step.completed {
             opacity: 1;
+            pointer-events: all;
             border-color: #4caf50;
             background: #f1f8f4;
         }
@@ -482,21 +483,30 @@
             <div class="column-inputs">
                 <div class="form-group">
                     <label for="answerColumn">Answer Column Letter:</label>
-                    <input type="text" id="answerColumn" placeholder="e.g., H" maxlength="3">
+                    <select id="answerColumn">
+                        <option value="">-- Select --</option>
+                    </select>
                     <small style="color: #666;">Column with text to analyze</small>
                 </div>
                 <div class="form-group">
                     <label for="topicStartColumn">Topics Start Letter:</label>
-                    <input type="text" id="topicStartColumn" placeholder="e.g., I" maxlength="3">
+                    <select id="topicStartColumn">
+                        <option value="">-- Select --</option>
+                    </select>
                     <small style="color: #666;">First topic column</small>
                 </div>
                 <div class="form-group">
                     <label for="topicEndColumn">Topics End Letter:</label>
-                    <input type="text" id="topicEndColumn" placeholder="e.g., Z" maxlength="3">
+                    <select id="topicEndColumn">
+                        <option value="">-- Select --</option>
+                    </select>
                     <small style="color: #666;">Last topic column</small>
                 </div>
             </div>
             <button class="button" id="previewButton" style="margin-top: 15px;">Preview Selection</button>
+            
+            <!-- Preview section status -->
+            <div class="status" id="previewStatus"></div>
             
             <div id="previewBox" style="display: none;">
                 <h4 style="margin: 15px 0 10px 0;">Preview:</h4>
@@ -518,6 +528,9 @@
             <button class="button success" id="runButton">
                 🚀 Run Program
             </button>
+            
+            <!-- Classification section status -->
+            <div class="status" id="classifyStatus"></div>
         </div>
 
         <!-- Progress Console -->
@@ -530,6 +543,41 @@
         let sheets = [];
         let columns = [];
         let currentLoadedSheet = null;  // Track which sheet is currently loaded
+
+        // Generate column letters A-Z, then AA-AZ (52 options total)
+        function getColumnLetters() {
+            const letters = [];
+            // A-Z
+            for (let i = 0; i < 26; i++) {
+                letters.push(String.fromCharCode(65 + i));
+            }
+            // AA-AZ
+            for (let i = 0; i < 26; i++) {
+                letters.push('A' + String.fromCharCode(65 + i));
+            }
+            return letters;
+        }
+
+        // Populate column dropdowns with letters
+        function populateColumnDropdowns() {
+            const letters = getColumnLetters();
+            const dropdowns = [answerColumn, topicStartColumn, topicEndColumn];
+            
+            dropdowns.forEach(dropdown => {
+                const currentValue = dropdown.value;
+                dropdown.innerHTML = '<option value="">-- Select --</option>';
+                letters.forEach(letter => {
+                    const option = document.createElement('option');
+                    option.value = letter;
+                    option.textContent = letter;
+                    dropdown.appendChild(option);
+                });
+                // Restore previous selection if it existed
+                if (currentValue && letters.includes(currentValue)) {
+                    dropdown.value = currentValue;
+                }
+            });
+        }
 
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
@@ -551,6 +599,8 @@
         const status = document.getElementById('status');
         const sheetSpinner = document.getElementById('sheetSpinner');
         const sheetStatus = document.getElementById('sheetStatus');
+        const previewStatus = document.getElementById('previewStatus');
+        const classifyStatus = document.getElementById('classifyStatus');
 
         // Step management
         function activateStep(stepNum) {
@@ -595,13 +645,16 @@
             sheetSpinner.classList.remove('visible');
             sheetStatus.classList.remove('visible');
 
-            answerColumn.value = '';
-            topicStartColumn.value = '';
-            topicEndColumn.value = '';
+            // Reset column dropdowns to default state
+            [answerColumn, topicStartColumn, topicEndColumn].forEach(dropdown => {
+                dropdown.innerHTML = '<option value="">-- Select --</option>';
+            });
 
             previewBox.style.display = 'none';
             previewContent.innerHTML = '';
             previewInfo.innerHTML = '';
+            previewStatus.classList.remove('visible');
+            previewStatus.textContent = '';
 
             progressConsole.classList.remove('visible');
             progressConsole.innerHTML = '';
@@ -609,6 +662,8 @@
             spinner.classList.remove('visible');
             status.classList.remove('visible');
             status.textContent = '';
+            classifyStatus.classList.remove('visible');
+            classifyStatus.textContent = '';
 
             document.querySelectorAll('.step').forEach((step, index) => {
                 step.classList.remove('completed', 'active');
@@ -734,9 +789,10 @@
             
             // If this is the same sheet that was already loaded during upload, just move to next step
             if (selectedSheet === currentLoadedSheet) {
-                completeStep(2);
-                activateStep(3);
-                return;
+                    completeStep(2);
+                    activateStep(3);
+                    populateColumnDropdowns();
+                    return;
             }
             
             // Different sheet selected - need to load it
@@ -778,6 +834,7 @@
                     
                     completeStep(2);
                     activateStep(3);
+                    populateColumnDropdowns();
                 } else {
                     sheetStatus.className = 'status error visible';
                     sheetStatus.textContent = `❌ Error loading sheet: ${result.error || 'Unknown error'}`;
@@ -790,6 +847,18 @@
             }
         }
 
+        // When column selection changes, hide preview and deactivate step 4 to prompt re-preview
+        function onColumnSelectionChange() {
+            previewBox.style.display = 'none';
+            previewStatus.classList.remove('visible');  // Clear any previous error
+            const step4 = document.getElementById('step4');
+            step4.classList.remove('active');
+        }
+        
+        answerColumn.addEventListener('change', onColumnSelectionChange);
+        topicStartColumn.addEventListener('change', onColumnSelectionChange);
+        topicEndColumn.addEventListener('change', onColumnSelectionChange);
+
         // Preview selection
         previewButton.addEventListener('click', async () => {
             const answer = answerColumn.value.trim().toUpperCase();
@@ -798,7 +867,7 @@
             const sheet = sheetSelect.value;
 
             if (!answer || !start || !end) {
-                showStatus('error', '❌ Please fill in all column letters');
+                showStatus('error', '❌ Please fill in all column letters', previewStatus);
                 return;
             }
 
@@ -821,6 +890,8 @@
                 const result = await response.json();
 
                 if (response.ok && result.success) {
+                    // Clear any previous error
+                    previewStatus.classList.remove('visible');
                     // Show preview
                     previewContent.innerHTML = '';
                     result.preview.forEach(item => {
@@ -898,13 +969,14 @@
                     `;
 
                     previewBox.style.display = 'block';
-                    completeStep(3);
+                    // Keep step 3 active so user can change columns and re-preview
+                    // Step 4 should also be active to allow running
                     activateStep(4);
                 } else {
-                    showStatus('error', `❌ ${result.error || 'Preview failed'}`);
+                    showStatus('error', `❌ ${result.error || 'Preview failed'}`, previewStatus);
                 }
             } catch (error) {
-                showStatus('error', `❌ Error: ${error.message}`);
+                showStatus('error', `❌ Error: ${error.message}`, previewStatus);
             } finally {
                 previewButton.disabled = false;
                 previewButton.textContent = 'Preview Selection';
@@ -940,11 +1012,11 @@
                     // Start polling for progress
                     pollProgress(result.session_id);
                 } else {
-                    showStatus('error', `❌ ${result.error || 'Classification failed'}`);
+                    showStatus('error', `❌ ${result.error || 'Classification failed'}`, classifyStatus);
                     runButton.disabled = false;
                 }
             } catch (error) {
-                showStatus('error', `❌ Error: ${error.message}`);
+                showStatus('error', `❌ Error: ${error.message}`, classifyStatus);
                 runButton.disabled = false;
             }
         });
@@ -989,16 +1061,16 @@
                             runButton.disabled = false;
                             
                             if (result.error) {
-                                showStatus('error', '❌ Classification failed. Check the console above for details.');
+                                showStatus('error', '❌ Classification failed. Check the console above for details.', classifyStatus);
                             } else {
-                                showStatus('success', '✅ Classification completed! Check your Desktop for the output CSV file.');
+                                showStatus('success', '✅ Classification completed! Check your Desktop for the output CSV file.', classifyStatus);
                                 completeStep(4);
                             }
                         }
                     })
                     .catch(error => {
                         if (currentInterval) clearInterval(currentInterval);
-                        showStatus('error', `❌ Error polling progress: ${error.message}`);
+                        showStatus('error', `❌ Error polling progress: ${error.message}`, classifyStatus);
                         runButton.disabled = false;
                     });
             }
@@ -1008,9 +1080,9 @@
             doPoll();  // Immediate first poll
         }
 
-        function showStatus(type, message) {
-            status.className = `status visible ${type}`;
-            status.innerHTML = message;
+        function showStatus(type, message, targetElement = status) {
+            targetElement.className = `status visible ${type}`;
+            targetElement.innerHTML = message;
         }
     </script>
 </body>

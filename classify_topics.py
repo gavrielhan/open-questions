@@ -100,6 +100,37 @@ class OpenAIConfig:
 # API CALL WITH BACKOFF & REPAIR
 # ================================================================
 
+def _convert_topic_codes_to_names(results: dict, topic_mapping: dict) -> dict:
+    """
+    Convert topic codes (T1, T2, etc.) back to actual topic names in the results.
+    
+    Args:
+        results: Dict like {"1": {"T1": 0, "T2": 1}, "2": {"T1": 1, "T2": 0}}
+        topic_mapping: Dict like {"T1": "actual topic name 1", "T2": "actual topic name 2"}
+    
+    Returns:
+        Dict with actual topic names: {"1": {"actual topic 1": 0, "actual topic 2": 1}, ...}
+    """
+    converted = {}
+    for text_id, topic_values in results.items():
+        if not isinstance(topic_values, dict):
+            converted[text_id] = topic_values
+            continue
+        
+        converted_topics = {}
+        for key, value in topic_values.items():
+            # Check if key is a topic code (T1, T2, etc.)
+            if key in topic_mapping:
+                actual_topic = topic_mapping[key]
+                converted_topics[actual_topic] = value
+            else:
+                # Key might already be the actual topic name
+                converted_topics[key] = value
+        converted[text_id] = converted_topics
+    
+    return converted
+
+
 def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIConfig) -> Tuple[dict, Dict[str, float]]:
     """
     Make a direct API call to get classification with logprobs for confidence calculation.
@@ -109,45 +140,41 @@ def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIC
     import requests
     import math
     
-    # Build the prompt
-    topics_text = inputs["topics"]
+    # Build the prompt with numbered topic references to avoid YAML issues with long Hebrew strings
     texts = inputs["texts"]
     question = inputs.get("question", "")
     
+    # Create numbered topic mapping for compact output
+    topic_mapping = {f"T{i+1}": topic for i, topic in enumerate(topics)}
+    topics_with_numbers = "\n".join([f"T{i+1}: {topic}" for i, topic in enumerate(topics)])
+    topic_keys = ", ".join([f"T{i+1}" for i in range(len(topics))])
+    
     system_prompt = (
         "Act like an expert annotator for academic media research specializing in Hebrew-language content analysis.\n\n"
-        "Your goal is to assign, for each Hebrew main text and each Hebrew topic, a binary label indicating whether the topic is clearly present in the text, and to output only a clean YAML structure.\n\n"
-        "Inputs:\n\n"
-        "- A question context that provides background for the texts.\n\n"
-        "- A list of numbered main texts in Hebrew.\n\n"
-        "- A list of topic names in Hebrew.\n\n"
-        "Task:\n\n"
+        "Your goal is to classify each Hebrew text against each topic and output a compact YAML structure.\n\n"
+        "Task:\n"
         "For every (text, topic) pair, output 1 if the topic is clearly and explicitly mentioned or discussed in the text; otherwise output 0.\n\n"
-        "Step-by-step:\n\n"
-        "1) Read and remember the full list of Hebrew topics, preserving each topic string exactly.\n\n"
-        "2) For each numbered text:\n\n"
-        "   a) If the text is empty, almost empty, or lacks substantive information, set all topics to 0.\n\n"
-        "   b) For each topic, check if the topic or an unambiguous paraphrase is clearly present or directly discussed.\n\n"
-        "   c) If the signal is vague, implicit, or requires outside knowledge, set 0.\n\n"
-        "   d) Set 1 only when the topic is clearly indicated in the text itself.\n\n"
-        "3) Do not infer topics beyond what is directly signaled by the text.\n\n"
-        "Output format (YAML only):\n\n"
-        "- A YAML list, where each element is a mapping for one text:\n\n"
-        "  - id: the text number as an integer.\n\n"
-        "  - One key per topic (exact topic strings), each with value 0 or 1.\n\n"
-        "Constraints:\n\n"
-        "- Output strictly valid YAML, properly indented.\n\n"
-        "- No markdown fences, no comments, no explanations, no extra keys.\n\n"
-        "- Use only integers 0 or 1.\n\n"
-        "- Include every topic exactly once per text.\n\n"
-        "Take a deep breath and work on this problem step-by-step."
+        "Rules:\n"
+        "- If text is empty or lacks substantive information, set all topics to 0.\n"
+        "- Set 1 only when the topic is clearly indicated in the text itself.\n"
+        "- Do not infer topics beyond what is directly signaled.\n\n"
+        "Output format (YAML only):\n"
+        "- Use topic codes (T1, T2, etc.) as keys, NOT the full topic text.\n"
+        "- Format: {text_number: {T1: 0, T2: 1, ...}, ...}\n"
+        "- Example for 2 texts and 3 topics:\n"
+        "  1: {T1: 0, T2: 1, T3: 0}\n"
+        "  2: {T1: 1, T2: 0, T3: 1}\n\n"
+        "Constraints:\n"
+        "- Output ONLY valid YAML, no markdown fences, no explanations.\n"
+        "- Use only integers 0 or 1.\n"
+        "- Include every topic code for every text."
     )
     
     user_prompt = (
         f"Question context: {question}\n\n"
-        f"Topics: {topics_text}\n\n"
-        f"Main texts (Hebrew):\n"
-        f"{texts}"
+        f"Topics (use these codes in output):\n{topics_with_numbers}\n\n"
+        f"Main texts (Hebrew):\n{texts}\n\n"
+        f"Output classification for each text using topic codes: {topic_keys}"
     )
     
     # Use the correct endpoint URL based on provider (Azure or LiteLLM)
@@ -157,7 +184,9 @@ def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIC
         "Authorization": f"Bearer {config.api_key}"
     }
     
-    classification_max_tokens = max(config.max_tokens, 3000)
+    # With compact topic codes (T1, T2, etc.), we need less tokens
+    # But still ensure enough for many texts × many topics
+    classification_max_tokens = max(config.max_tokens, 4000)
     
     # Build payload - Azure doesn't need model in payload if it's in the URL
     payload = {
@@ -228,12 +257,15 @@ def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIC
                     raise
                 initial_results = repaired
             
+            # Convert topic codes (T1, T2, etc.) back to actual topic names
+            converted_results = _convert_topic_codes_to_names(initial_results, topic_mapping)
+            
             # Note: Azure doesn't support logprobs, so we return default confidence
             # Confidence is now determined by model agreement (GPT vs DeepSeek)
-            text_keys = list(initial_results.keys())
+            text_keys = list(converted_results.keys())
             per_text_confidence = {key: 1.0 for key in text_keys}
             
-            return initial_results, per_text_confidence
+            return converted_results, per_text_confidence
             
         except Exception as e:
             error_str = str(e)
@@ -348,45 +380,41 @@ def _classify_with_deepseek(inputs: dict, topics: Sequence[str], config: OpenAIC
     Classify texts using DeepSeek model (for parallel comparison with GPT-5.1).
     Returns: results_dict mapping text number to topic classifications.
     """
-    # Build the prompt (same as GPT-5.1)
-    topics_text = inputs["topics"]
+    # Build the prompt with numbered topic references (same format as GPT-5.1)
     texts = inputs["texts"]
     question = inputs.get("question", "")
     
+    # Create numbered topic mapping for compact output
+    topic_mapping = {f"T{i+1}": topic for i, topic in enumerate(topics)}
+    topics_with_numbers = "\n".join([f"T{i+1}: {topic}" for i, topic in enumerate(topics)])
+    topic_keys = ", ".join([f"T{i+1}" for i in range(len(topics))])
+    
     system_prompt = (
         "Act like an expert annotator for academic media research specializing in Hebrew-language content analysis.\n\n"
-        "Your goal is to assign, for each Hebrew main text and each Hebrew topic, a binary label indicating whether the topic is clearly present in the text, and to output only a clean YAML structure.\n\n"
-        "Inputs:\n\n"
-        "- A question context that provides background for the texts.\n\n"
-        "- A list of numbered main texts in Hebrew.\n\n"
-        "- A list of topic names in Hebrew.\n\n"
-        "Task:\n\n"
+        "Your goal is to classify each Hebrew text against each topic and output a compact YAML structure.\n\n"
+        "Task:\n"
         "For every (text, topic) pair, output 1 if the topic is clearly and explicitly mentioned or discussed in the text; otherwise output 0.\n\n"
-        "Step-by-step:\n\n"
-        "1) Read and remember the full list of Hebrew topics, preserving each topic string exactly.\n\n"
-        "2) For each numbered text:\n\n"
-        "   a) If the text is empty, almost empty, or lacks substantive information, set all topics to 0.\n\n"
-        "   b) For each topic, check if the topic or an unambiguous paraphrase is clearly present or directly discussed.\n\n"
-        "   c) If the signal is vague, implicit, or requires outside knowledge, set 0.\n\n"
-        "   d) Set 1 only when the topic is clearly indicated in the text itself.\n\n"
-        "3) Do not infer topics beyond what is directly signaled by the text.\n\n"
-        "Output format (YAML only):\n\n"
-        "- A YAML list, where each element is a mapping for one text:\n\n"
-        "  - id: the text number as an integer.\n\n"
-        "  - One key per topic (exact topic strings), each with value 0 or 1.\n\n"
-        "Constraints:\n\n"
-        "- Output strictly valid YAML, properly indented.\n\n"
-        "- No markdown fences, no comments, no explanations, no extra keys.\n\n"
-        "- Use only integers 0 or 1.\n\n"
-        "- Include every topic exactly once per text.\n\n"
-        "Take a deep breath and work on this problem step-by-step."
+        "Rules:\n"
+        "- If text is empty or lacks substantive information, set all topics to 0.\n"
+        "- Set 1 only when the topic is clearly indicated in the text itself.\n"
+        "- Do not infer topics beyond what is directly signaled.\n\n"
+        "Output format (YAML only):\n"
+        "- Use topic codes (T1, T2, etc.) as keys, NOT the full topic text.\n"
+        "- Format: {text_number: {T1: 0, T2: 1, ...}, ...}\n"
+        "- Example for 2 texts and 3 topics:\n"
+        "  1: {T1: 0, T2: 1, T3: 0}\n"
+        "  2: {T1: 1, T2: 0, T3: 1}\n\n"
+        "Constraints:\n"
+        "- Output ONLY valid YAML, no markdown fences, no explanations.\n"
+        "- Use only integers 0 or 1.\n"
+        "- Include every topic code for every text."
     )
     
     user_prompt = (
         f"Question context: {question}\n\n"
-        f"Topics: {topics_text}\n\n"
-        f"Main texts (Hebrew):\n"
-        f"{texts}"
+        f"Topics (use these codes in output):\n{topics_with_numbers}\n\n"
+        f"Main texts (Hebrew):\n{texts}\n\n"
+        f"Output classification for each text using topic codes: {topic_keys}"
     )
     
     # Use DeepSeek endpoint
@@ -403,7 +431,7 @@ def _classify_with_deepseek(inputs: dict, topics: Sequence[str], config: OpenAIC
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "max_tokens": 3000,
+        "max_tokens": 4000,  # Increased for compact topic codes format
     }
     
     error_log: List[str] = []
@@ -419,7 +447,8 @@ def _classify_with_deepseek(inputs: dict, topics: Sequence[str], config: OpenAIC
             # Parse YAML response
             try:
                 results = _parse_yaml_content(message_content)
-                return results
+                # Convert topic codes (T1, T2, etc.) back to actual topic names
+                return _convert_topic_codes_to_names(results, topic_mapping)
             except ValueError as yaml_error:
                 error_msg = str(yaml_error)
                 print(f"⚠️  DeepSeek YAML error: {error_msg}", file=sys.stderr)
@@ -434,7 +463,8 @@ def _classify_with_deepseek(inputs: dict, topics: Sequence[str], config: OpenAIC
                     error_log=error_log,
                 )
                 if repaired is not None:
-                    return repaired
+                    # Convert repaired results too
+                    return _convert_topic_codes_to_names(repaired, topic_mapping)
                 raise
                 
         except Exception as e:
@@ -712,25 +742,26 @@ def _repair_yaml_with_deepseek(
     if error_log:
         error_context += "\n🧾 ERROR HISTORY:\n" + "\n".join(f"- {entry}" for entry in error_log) + "\n"
     
+    # Create topic code mapping for reference
+    topic_codes = [f"T{i+1}" for i in range(len(topic_columns))]
+    
     prompt = (
         "You are a YAML repair expert. The following YAML should map row numbers to topic classifications "
-        "(in Hebrew), but it contains formatting errors.\n\n"
+        "using topic codes (T1, T2, etc.), but it contains formatting errors.\n\n"
         "🎯 YOUR TASK: Fix the YAML so it becomes 100% valid and strictly follows the required schema.\n\n"
         f"{error_context}"
         "✅ REQUIRED YAML FORMAT:\n"
-        "1:\n"
-        "  <topic name in Hebrew>: 0 or 1\n"
-        "  <topic name in Hebrew>: 0 or 1\n"
-        "2:\n"
-        "  ...\n\n"
+        "1: {T1: 0, T2: 1, T3: 0, ...}\n"
+        "2: {T1: 1, T2: 0, T3: 1, ...}\n"
+        "...\n\n"
         "🔍 CRITICAL RULES:\n"
-        "1. Use YAML mappings only (no lists, no prose, no JSON).\n"
-        "2. Topic names must appear exactly as provided; do not translate or rename them.\n"
+        "1. Use YAML mappings with inline format: {T1: 0, T2: 1, ...}\n"
+        "2. Topic keys must be T1, T2, T3, etc. (codes, not full names).\n"
         "3. Values must be integers 0 or 1 (not booleans or strings).\n"
-        "4. Keep the row numbering identical (\"1\", \"2\", ...).\n"
+        "4. Keep the row numbering identical (1, 2, ...).\n"
         "5. Do not wrap the output in markdown fences or add commentary.\n"
         "6. Preserve all rows and topics present in the input.\n\n"
-        f"📋 Expected topics: {', '.join(topic_columns)}\n\n"
+        f"📋 Expected topic codes: {', '.join(topic_codes)}\n\n"
         "🔧 BROKEN YAML TO FIX:\n"
         f"{broken_yaml}"
     )
@@ -782,15 +813,21 @@ def _repair_yaml_with_gpt(
     if error_log:
         error_context += "\n🧾 ERROR HISTORY:\n" + "\n".join(f"- {entry}" for entry in error_log) + "\n"
 
+    # Create topic code mapping for reference
+    topic_codes = [f"T{i+1}" for i in range(len(topic_columns))]
+    
     prompt = (
         "You previously generated YAML for topic classifications, but it failed to parse.\n"
-        "Fix ONLY the formatting issues so the YAML becomes valid and uses the exact same topics and structure.\n\n"
-        "🎯 REQUIREMENTS:\n"
-        "1. Preserve all existing topic names in Hebrew exactly.\n"
-        "2. Keep the same row numbering (\"1\", \"2\", ...).\n"
-        "3. Values must be integers 0 or 1 (not booleans or strings).\n"
-        "4. Output must be pure YAML mappings (no JSON, no prose, no code fences).\n"
-        "5. Return ONLY the corrected YAML block with no commentary.\n"
+        "Fix ONLY the formatting issues so the YAML becomes valid.\n\n"
+        "🎯 REQUIRED FORMAT:\n"
+        "1: {T1: 0, T2: 1, T3: 0, ...}\n"
+        "2: {T1: 1, T2: 0, T3: 1, ...}\n\n"
+        "🔍 RULES:\n"
+        "1. Use topic codes (T1, T2, etc.) as keys, NOT full topic names.\n"
+        "2. Keep the same row numbering (1, 2, ...).\n"
+        "3. Values must be integers 0 or 1.\n"
+        "4. Output must be pure YAML (no code fences, no commentary).\n"
+        f"5. Expected topic codes: {', '.join(topic_codes)}\n"
         f"{error_context}\n"
         "Broken YAML:\n"
         f"{broken_yaml}"
