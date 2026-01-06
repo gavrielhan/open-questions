@@ -143,6 +143,7 @@ def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIC
     # Build the prompt with numbered topic references to avoid YAML issues with long Hebrew strings
     texts = inputs["texts"]
     question = inputs.get("question", "")
+    topic_context = inputs.get("topic_context", "")
     
     # Create numbered topic mapping for compact output
     topic_mapping = {f"T{i+1}": topic for i, topic in enumerate(topics)}
@@ -153,11 +154,16 @@ def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIC
         "Act like an expert annotator for academic media research specializing in Hebrew-language content analysis.\n\n"
         "Your goal is to classify each Hebrew text against each topic and output a compact YAML structure.\n\n"
         "Task:\n"
-        "For every (text, topic) pair, output 1 if the topic is clearly and explicitly mentioned or discussed in the text; otherwise output 0.\n\n"
+        "For every (text, topic) pair, output 1 if the topic is mentioned, discussed, or semantically related to the text content; otherwise output 0.\n\n"
+        "IMPORTANT - Interpreting Topics:\n"
+        "- Topic labels may be short or concise. Interpret each topic as representing the FULL semantic concept, not just exact keyword matches.\n"
+        "- Consider synonyms, related terms, paraphrases, and conceptually equivalent expressions in Hebrew.\n"
+        "- Use the detailed topic explanations provided below to understand what each topic truly represents.\n"
+        "- Think broadly about what each topic represents as a concept or theme.\n\n"
         "Rules:\n"
         "- If text is empty or lacks substantive information, set all topics to 0.\n"
-        "- Set 1 only when the topic is clearly indicated in the text itself.\n"
-        "- Do not infer topics beyond what is directly signaled.\n\n"
+        "- Set 1 when the topic's concept is present in the text (directly or through related terms).\n"
+        "- Consider the semantic meaning, not just literal word matching.\n\n"
         "Output format (YAML only):\n"
         "- Use topic codes (T1, T2, etc.) as keys, NOT the full topic text.\n"
         "- Format: {text_number: {T1: 0, T2: 1, ...}, ...}\n"
@@ -170,9 +176,15 @@ def _classify_with_logprobs(inputs: dict, topics: Sequence[str], config: OpenAIC
         "- Include every topic code for every text."
     )
     
+    # Build user prompt with topic context if available
+    topic_context_section = ""
+    if topic_context:
+        topic_context_section = f"\n📚 Detailed Topic Understanding:\n{topic_context}\n"
+    
     user_prompt = (
-        f"Question context: {question}\n\n"
-        f"Topics (use these codes in output):\n{topics_with_numbers}\n\n"
+        f"Survey/Question context: {question}\n\n"
+        f"Topics (use these codes in output):\n{topics_with_numbers}\n"
+        f"{topic_context_section}\n"
         f"Main texts (Hebrew):\n{texts}\n\n"
         f"Output classification for each text using topic codes: {topic_keys}"
     )
@@ -383,6 +395,7 @@ def _classify_with_deepseek(inputs: dict, topics: Sequence[str], config: OpenAIC
     # Build the prompt with numbered topic references (same format as GPT-5.1)
     texts = inputs["texts"]
     question = inputs.get("question", "")
+    topic_context = inputs.get("topic_context", "")
     
     # Create numbered topic mapping for compact output
     topic_mapping = {f"T{i+1}": topic for i, topic in enumerate(topics)}
@@ -393,11 +406,16 @@ def _classify_with_deepseek(inputs: dict, topics: Sequence[str], config: OpenAIC
         "Act like an expert annotator for academic media research specializing in Hebrew-language content analysis.\n\n"
         "Your goal is to classify each Hebrew text against each topic and output a compact YAML structure.\n\n"
         "Task:\n"
-        "For every (text, topic) pair, output 1 if the topic is clearly and explicitly mentioned or discussed in the text; otherwise output 0.\n\n"
+        "For every (text, topic) pair, output 1 if the topic is mentioned, discussed, or semantically related to the text content; otherwise output 0.\n\n"
+        "IMPORTANT - Interpreting Topics:\n"
+        "- Topic labels may be short or concise. Interpret each topic as representing the FULL semantic concept, not just exact keyword matches.\n"
+        "- Consider synonyms, related terms, paraphrases, and conceptually equivalent expressions in Hebrew.\n"
+        "- Use the detailed topic explanations provided below to understand what each topic truly represents.\n"
+        "- Think broadly about what each topic represents as a concept or theme.\n\n"
         "Rules:\n"
         "- If text is empty or lacks substantive information, set all topics to 0.\n"
-        "- Set 1 only when the topic is clearly indicated in the text itself.\n"
-        "- Do not infer topics beyond what is directly signaled.\n\n"
+        "- Set 1 when the topic's concept is present in the text (directly or through related terms).\n"
+        "- Consider the semantic meaning, not just literal word matching.\n\n"
         "Output format (YAML only):\n"
         "- Use topic codes (T1, T2, etc.) as keys, NOT the full topic text.\n"
         "- Format: {text_number: {T1: 0, T2: 1, ...}, ...}\n"
@@ -410,9 +428,15 @@ def _classify_with_deepseek(inputs: dict, topics: Sequence[str], config: OpenAIC
         "- Include every topic code for every text."
     )
     
+    # Build user prompt with topic context if available
+    topic_context_section = ""
+    if topic_context:
+        topic_context_section = f"\n📚 Detailed Topic Understanding:\n{topic_context}\n"
+    
     user_prompt = (
-        f"Question context: {question}\n\n"
-        f"Topics (use these codes in output):\n{topics_with_numbers}\n\n"
+        f"Survey/Question context: {question}\n\n"
+        f"Topics (use these codes in output):\n{topics_with_numbers}\n"
+        f"{topic_context_section}\n"
         f"Main texts (Hebrew):\n{texts}\n\n"
         f"Output classification for each text using topic codes: {topic_keys}"
     )
@@ -926,10 +950,117 @@ def _repair_yaml_auto(
 
 
 # ================================================================
+# TOPIC CONTEXT GENERATION
+# ================================================================
+
+def _generate_topic_context(
+    topics: Sequence[str], 
+    answer_column_name: str, 
+    config: OpenAIConfig
+) -> str:
+    """
+    Generate a detailed context explaining what each topic means.
+    This is called once at the start of classification to give the model
+    full understanding of the topics before processing texts.
+    
+    Args:
+        topics: List of topic column names/labels
+        answer_column_name: Name of the answer column (may provide context)
+        config: API configuration
+    
+    Returns:
+        A detailed context string explaining each topic
+    """
+    print("📚 Generating topic context for better classification...")
+    
+    topics_list = "\n".join([f"- T{i+1}: {topic}" for i, topic in enumerate(topics)])
+    
+    system_prompt = (
+        "You are an expert in Hebrew language and academic research analysis.\n\n"
+        "Your task is to create a detailed understanding of each topic that will be used for text classification.\n"
+        "For each topic, provide a clear explanation (max 15 words) of what it represents, including:\n"
+        "- The core concept/theme\n"
+        "- Related terms, synonyms, or expressions in Hebrew that would indicate this topic\n"
+        "- What kind of content would match this topic\n\n"
+        "Output format:\n"
+        "T1: [brief explanation of topic 1 and related terms]\n"
+        "T2: [brief explanation of topic 2 and related terms]\n"
+        "...\n\n"
+        "CRITICAL RULES:\n"
+        "- Keep each explanation concise but comprehensive (max 15 words per topic).\n"
+        "- Focus on semantic meaning, not just literal keywords.\n"
+        "- NEVER include phrases like 'no relevant answer', 'not applicable', 'none', or similar.\n"
+        "- Every topic MUST have a meaningful explanation of what it represents.\n"
+        "- If a topic seems unclear, interpret it as broadly as possible based on the survey context.\n"
+        "- The classification model will output 0 for all topics if no match is found - you don't need to handle that."
+    )
+    
+    user_prompt = (
+        f"Survey/Question Context: '{answer_column_name}'\n\n"
+        f"Topics to explain:\n{topics_list}\n\n"
+        f"Please provide a clear, meaningful explanation for each topic (T1, T2, etc.) that helps understand "
+        f"what kind of Hebrew text content would match each topic. Consider the survey context above.\n\n"
+        f"Remember: Every topic must have a real explanation. Do NOT use 'no answer' or 'not applicable' phrases."
+    )
+    
+    url = config.get_chat_completions_url()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config.api_key}"
+    }
+    
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+    }
+    
+    if config.is_azure():
+        payload["max_completion_tokens"] = 1500
+    else:
+        payload["model"] = config.model
+        payload["max_tokens"] = 1500
+        payload["temperature"] = 0
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        
+        context = data["choices"][0]["message"]["content"].strip()
+        print("✅ Topic context generated successfully")
+        
+        # Print the full context to the progress console so user can see it
+        print("=" * 50)
+        print("📋 TOPIC UNDERSTANDING (Generated)")
+        print("=" * 50)
+        # Print each line of the context
+        for line in context.split("\n"):
+            if line.strip():
+                print(f"  {line.strip()}")
+        print("=" * 50)
+        
+        return context
+        
+    except Exception as e:
+        print(f"⚠️  Failed to generate topic context: {e}")
+        print("   Continuing without detailed context...")
+        # Return a basic context if generation fails
+        return "\n".join([f"T{i+1}: {topic}" for i, topic in enumerate(topics)])
+
+
+# ================================================================
 # CLASSIFICATION
 # ================================================================
 
-def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, config: OpenAIConfig) -> List[Dict[str, Union[int, str]]]:
+def classify_batch(
+    texts: Sequence[str], 
+    topics: Sequence[str], 
+    question: str, 
+    config: OpenAIConfig,
+    topic_context: str = ""
+) -> List[Dict[str, Union[int, str]]]:
     """
     Classify a batch of texts using PARALLEL DUAL-MODEL approach.
     
@@ -972,6 +1103,7 @@ def classify_batch(texts: Sequence[str], topics: Sequence[str], question: str, c
         "topics": topics_text,
         "texts": enumerated_texts,
         "question": question,
+        "topic_context": topic_context,  # Pre-generated detailed topic understanding
     }
     
     print("  🔄 Running parallel classification (GPT-5.1 + DeepSeek)...", file=sys.stderr)
@@ -1172,6 +1304,10 @@ def update_topics(
         file=sys.stderr
     )
 
+    # Generate detailed topic context ONCE before processing all batches
+    # This gives the model full understanding of what each topic means
+    topic_context = _generate_topic_context(topic_cols, main_column, config)
+
     failed_batches: List[Tuple[int, List[Any], Exception]] = []
 
     with ThreadPoolExecutor(max_workers=config.parallel_workers) as executor:
@@ -1179,7 +1315,7 @@ def update_topics(
 
         for batch_idx, batch in enumerate(batches, start=1):
             texts = [text for _, text in batch]
-            future = executor.submit(classify_batch, texts, topic_cols, main_column, config)
+            future = executor.submit(classify_batch, texts, topic_cols, main_column, config, topic_context)
             futures[future] = (batch_idx, batch)
 
         for future in as_completed(futures):

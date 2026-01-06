@@ -47,6 +47,9 @@ ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
 # Store for progress messages per session
 progress_queues = {}
 
+# Store for output file paths per session (for download)
+output_files = {}
+
 
 def allowed_file(filename: str) -> bool:
     """Check if file has an allowed extension."""
@@ -503,8 +506,18 @@ def preview_data():
             }
             preview_data.append(row_data)
         
-        # Format topic columns as numbered list
-        topic_columns_formatted = [f"{idx}) {topic}" for idx, topic in enumerate(topic_columns, 1)]
+        # Format topic columns as numbered list with column letter for clarity
+        # Show: "1) [K] Topic Name" format so users know which column each topic is in
+        topic_columns_formatted = []
+        for idx, topic in enumerate(topic_columns):
+            col_letter = column_index_to_letter(topic_start_idx + idx)
+            # Truncate topic name to ~15 words max for readability, keeping full meaning
+            words = str(topic).split()
+            if len(words) > 15:
+                topic_display = ' '.join(words[:15]) + '...'
+            else:
+                topic_display = str(topic)
+            topic_columns_formatted.append(f"{idx + 1}) [{col_letter}] {topic_display}")
         
         return jsonify({
             'success': True,
@@ -601,7 +614,14 @@ def classify():
                 
                 df_classified.to_csv(output_path, index=False)
                 
+                # Store output file path for download
+                output_files[session_id] = {
+                    'path': str(output_path),
+                    'filename': output_filename
+                }
+                
                 queue.put(f"✅ COMPLETE: Saved to {output_path}")
+                queue.put(f"DOWNLOAD_READY:{output_filename}")
                 queue.put("DONE")
                 
             except Exception as e:
@@ -637,6 +657,8 @@ def get_progress(session_id):
     messages = []
     done = False
     error = False
+    download_ready = False
+    download_filename = None
     
     # Get all messages from queue
     queue = progress_queues[session_id]
@@ -647,14 +669,45 @@ def get_progress(session_id):
         elif msg == "ERROR":
             done = True
             error = True
+        elif msg.startswith("DOWNLOAD_READY:"):
+            download_ready = True
+            download_filename = msg.split(":", 1)[1]
         else:
             messages.append(msg)
     
-    return jsonify({
+    response = {
         'messages': messages,
         'done': done,
         'error': error
-    })
+    }
+    
+    # Include download info if ready
+    if download_ready and download_filename:
+        response['download_ready'] = True
+        response['download_filename'] = download_filename
+        response['download_url'] = f'/download/{session_id}'
+    
+    return jsonify(response)
+
+
+@app.route('/download/<session_id>')
+def download_file(session_id):
+    """Download the classified output file."""
+    if session_id not in output_files:
+        return jsonify({'error': 'No file available for download'}), 404
+    
+    file_info = output_files[session_id]
+    file_path = Path(file_info['path'])
+    
+    if not file_path.exists():
+        return jsonify({'error': 'File not found'}), 404
+    
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name=file_info['filename'],
+        mimetype='text/csv'
+    )
 
 
 @app.route('/status')

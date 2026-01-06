@@ -529,6 +529,13 @@
                 🚀 Run Program
             </button>
             
+            <!-- Download button (hidden until file is ready) -->
+            <a id="downloadLink" style="display: none;" download>
+                <button class="button" id="downloadButton" style="display: none; background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); margin-top: 10px;">
+                    📥 Download Classified File
+                </button>
+            </a>
+            
             <!-- Classification section status -->
             <div class="status" id="classifyStatus"></div>
         </div>
@@ -594,6 +601,8 @@
         const previewContent = document.getElementById('previewContent');
         const previewInfo = document.getElementById('previewInfo');
         const runButton = document.getElementById('runButton');
+        const downloadButton = document.getElementById('downloadButton');
+        const downloadLink = document.getElementById('downloadLink');
         const progressConsole = document.getElementById('progressConsole');
         const spinner = document.getElementById('spinner');
         const status = document.getElementById('status');
@@ -658,6 +667,10 @@
 
             progressConsole.classList.remove('visible');
             progressConsole.innerHTML = '';
+            
+            // Hide download button
+            downloadLink.style.display = 'none';
+            downloadButton.style.display = 'none';
 
             spinner.classList.remove('visible');
             status.classList.remove('visible');
@@ -993,6 +1006,10 @@
             runButton.disabled = true;
             progressConsole.classList.add('visible');
             progressConsole.innerHTML = '<div class="progress-line">Starting classification...</div>';
+            
+            // Hide download button from previous run
+            downloadLink.style.display = 'none';
+            downloadButton.style.display = 'none';
 
             try {
                 const response = await fetch('/classify', {
@@ -1055,6 +1072,16 @@
                         // Scroll to bottom
                         progressConsole.scrollTop = progressConsole.scrollHeight;
 
+                        // Check if download is ready - show button immediately
+                        if (result.download_ready && result.download_url) {
+                            // Set up download link and show button
+                            downloadLink.href = result.download_url;
+                            downloadLink.download = result.download_filename || 'classified_output.csv';
+                            downloadLink.style.display = 'block';
+                            downloadButton.style.display = 'block';
+                            downloadButton.textContent = `📥 Download: ${result.download_filename}`;
+                        }
+                        
                         // Check if done
                         if (result.done) {
                             if (currentInterval) clearInterval(currentInterval);
@@ -1063,7 +1090,7 @@
                             if (result.error) {
                                 showStatus('error', '❌ Classification failed. Check the console above for details.', classifyStatus);
                             } else {
-                                showStatus('success', '✅ Classification completed! Check your Desktop for the output CSV file.', classifyStatus);
+                                showStatus('success', '✅ Classification completed! Click the download button below or check your Desktop.', classifyStatus);
                                 completeStep(4);
                             }
                         }
